@@ -18,6 +18,7 @@ import { dirname, join, relative, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import test from "node:test";
 import { setTimeout as delay } from "node:timers/promises";
+import { INITIAL_GUIDE } from "../src/index.mjs";
 
 const packageRoot = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 const packageMetadata = JSON.parse(readFileSync(join(packageRoot, "package.json"), "utf8"));
@@ -108,6 +109,85 @@ function listFiles(root, current = root) {
   }
   return files.sort();
 }
+
+test("initializes the Git repository root without generating targets", (t) => {
+  const root = temporaryDirectory(t);
+  const nested = join(root, "packages", "app");
+  mkdirSync(join(root, ".git"));
+  mkdirSync(nested, { recursive: true });
+
+  const init = runCli(nested, "init");
+  assert.equal(init.status, 0, init.stderr);
+  assert.match(init.stdout, /Initialized agent guidance at \.agents\/guide\.md/);
+  assert.equal(read(root, ".agents/guide.md"), INITIAL_GUIDE);
+  assert.equal(lstatIfExists(join(nested, ".agents")), null);
+  for (const relativePath of generatedPaths) {
+    assert.equal(lstatIfExists(join(root, relativePath)), null);
+  }
+  assert.equal(listFiles(root).some((path) => path.endsWith(".tmp")), false);
+});
+
+test("initializes the current directory when no Git repository is present", (t) => {
+  const root = temporaryDirectory(t);
+  const nested = join(root, "standalone");
+  mkdirSync(nested);
+
+  const init = runCli(nested, "init");
+  assert.equal(init.status, 0, init.stderr);
+  assert.equal(read(nested, ".agents/guide.md"), INITIAL_GUIDE);
+  assert.equal(lstatIfExists(join(root, ".agents")), null);
+});
+
+test("init is idempotent and never overwrites an existing canonical source", (t) => {
+  const root = temporaryDirectory(t);
+  const existingGuide = "# Existing repository guidance\n";
+  write(root, ".agents/guide.md", existingGuide);
+
+  const init = runCli(root, "init");
+  assert.equal(init.status, 0, init.stderr);
+  assert.match(init.stdout, /already initialized/);
+  assert.equal(read(root, ".agents/guide.md"), existingGuide);
+});
+
+test("init rejects symlinked canonical source paths without following them", (t) => {
+  const directoryRoot = temporaryDirectory(t);
+  const outsideDirectory = temporaryDirectory(t, "agent-guidance-init-outside-");
+  if (!createSymlinkOrSkip(t, outsideDirectory, join(directoryRoot, ".agents"), "dir")) return;
+
+  const directoryResult = runCli(directoryRoot, "init");
+  assert.equal(directoryResult.status, 1);
+  assert.match(directoryResult.stderr, /Canonical source directory must not be a symlink/);
+  assert.deepEqual(listFiles(outsideDirectory), []);
+
+  const fileRoot = temporaryDirectory(t);
+  mkdirSync(join(fileRoot, ".agents"));
+  const outsideGuide = join(outsideDirectory, "outside-guide.md");
+  writeFileSync(outsideGuide, "# Outside guide\n");
+  if (!createSymlinkOrSkip(t, outsideGuide, join(fileRoot, ".agents", "guide.md"), "file")) return;
+
+  const fileResult = runCli(fileRoot, "init");
+  assert.equal(fileResult.status, 1);
+  assert.match(fileResult.stderr, /Canonical source must not be a symlink/);
+  assert.equal(readFileSync(outsideGuide, "utf8"), "# Outside guide\n");
+});
+
+test("init rejects non-directory and non-regular canonical source paths", (t) => {
+  const directoryRoot = temporaryDirectory(t);
+  writeFileSync(join(directoryRoot, ".agents"), "not a directory\n");
+
+  const directoryResult = runCli(directoryRoot, "init");
+  assert.equal(directoryResult.status, 1);
+  assert.match(directoryResult.stderr, /Canonical source path is not a directory/);
+  assert.equal(readFileSync(join(directoryRoot, ".agents"), "utf8"), "not a directory\n");
+
+  const fileRoot = temporaryDirectory(t);
+  mkdirSync(join(fileRoot, ".agents", "guide.md"), { recursive: true });
+
+  const fileResult = runCli(fileRoot, "init");
+  assert.equal(fileResult.status, 1);
+  assert.match(fileResult.stderr, /Canonical source is not a regular file/);
+  assert.equal(lstatSync(join(fileRoot, ".agents", "guide.md")).isDirectory(), true);
+});
 
 test("generates deterministic repository-wide guidance for every supported agent", (t) => {
   const root = temporaryRepo(t);
@@ -527,9 +607,17 @@ test("reports missing sources and invalid CLI combinations without writing", (t)
   assert.equal(duplicate.status, 2);
   assert.match(duplicate.stderr, /Duplicate option: --adopt/);
 
+  const invalidInit = runCli(root, "init", "--force");
+  assert.equal(invalidInit.status, 2);
+  assert.match(invalidInit.stderr, /init does not accept --adopt or --force/);
+
   const commandHelp = runCli(root, "sync", "--help");
   assert.equal(commandHelp.status, 0, commandHelp.stderr);
   assert.match(commandHelp.stdout, /missing, stale, unmanaged, or unsafe/);
+
+  const initHelp = runCli(root, "init", "--help");
+  assert.equal(initHelp.status, 0, initHelp.stderr);
+  assert.match(initHelp.stdout, /without overwriting an existing source/);
   assert.deepEqual(listFiles(root), []);
 });
 
@@ -594,6 +682,28 @@ test("packs, installs, and runs the published artifact", (t) => {
   });
   assert.equal(version.status, 0, version.stderr);
   assert.equal(version.stdout, `${packageMetadata.version}\n`);
+
+  const init = spawnSync(process.execPath, [installedCli, "init"], {
+    cwd: consumerRoot,
+    encoding: "utf8",
+  });
+  assert.equal(init.status, 0, init.stderr);
+  assert.equal(read(consumerRoot, ".agents/guide.md"), INITIAL_GUIDE);
+
+  const sync = spawnSync(process.execPath, [installedCli, "sync"], {
+    cwd: consumerRoot,
+    encoding: "utf8",
+  });
+  assert.equal(sync.status, 0, sync.stderr);
+  for (const relativePath of generatedPaths) {
+    assert.ok(lstatIfExists(join(consumerRoot, relativePath)));
+  }
+
+  const check = spawnSync(process.execPath, [installedCli, "check"], {
+    cwd: consumerRoot,
+    encoding: "utf8",
+  });
+  assert.equal(check.status, 0, check.stderr);
 });
 
 function lstatIfExists(path) {

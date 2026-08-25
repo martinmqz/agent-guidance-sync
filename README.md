@@ -8,18 +8,26 @@ guidance with AI and it is not an MCP server.
 
 ## Status
 
-The initial milestone supports repository-wide guidance from
-`.agents/guide.md`. Scoped rules, configuration, and `init` are planned but are
-not part of this slice yet.
+The initial milestone supports safe initialization and repository-wide guidance
+from `.agents/guide.md`. Scoped rules and configuration are planned but are not
+part of this slice yet.
 
 ## Usage
 
-Create `.agents/guide.md`, then run:
+Initialize the current Git repository, edit the new canonical guide, then sync
+and check the generated files:
 
 ```sh
+npx @martinmqz/agent-guidance-sync init
+# Edit .agents/guide.md
 npx @martinmqz/agent-guidance-sync sync
 npx @martinmqz/agent-guidance-sync check
 ```
+
+`init` finds the nearest Git repository root from the current directory. When
+there is no Git repository, it initializes the current directory. It creates
+only `.agents/guide.md`, never overwrites an existing source, and leaves output
+generation to an explicit `sync`.
 
 The package installs the `agent-guidance` executable and generates:
 

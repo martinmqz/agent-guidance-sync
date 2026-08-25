@@ -29,6 +29,11 @@ const packageMetadata = JSON.parse(readFileSync(new URL("../package.json", impor
 
 export const VERSION = packageMetadata.version;
 export const SOURCE_PATH = ".agents/guide.md";
+export const INITIAL_GUIDE = `# Repository Agent Guidance
+
+Replace this text with the coding-agent instructions that apply throughout this
+repository.
+`;
 
 const GENERATED_FORMAT_VERSION = 1;
 const TARGET_PATHS = Object.freeze({
@@ -217,6 +222,138 @@ export function findProjectRoot(startDirectory = process.cwd()) {
   );
 }
 
+export function findInitializationRoot(startDirectory = process.cwd()) {
+  const startingPath = resolve(startDirectory);
+  const startStats = lstatIfExists(startingPath);
+  if (!startStats?.isDirectory() || startStats.isSymbolicLink()) {
+    throw new GuidanceError(`Starting path must be a real directory: ${startingPath}`);
+  }
+
+  let current = startingPath;
+  while (true) {
+    if (lstatIfExists(join(current, ".git"))) return current;
+    const parent = dirname(current);
+    if (parent === current || current === parse(current).root) return startingPath;
+    current = parent;
+  }
+}
+
+export function initProject(root) {
+  const projectRoot = resolve(root);
+  const rootStats = lstatIfExists(projectRoot);
+  if (!rootStats?.isDirectory() || rootStats.isSymbolicLink()) {
+    throw new GuidanceError(`Project root must be a real directory: ${projectRoot}`);
+  }
+
+  const agentsPath = join(projectRoot, ".agents");
+  let agentsStats = lstatIfExists(agentsPath);
+  if (!agentsStats) {
+    try {
+      mkdirSync(agentsPath, { mode: 0o755 });
+    } catch (error) {
+      if (!error || typeof error !== "object" || error.code !== "EEXIST") {
+        throw new GuidanceError(`Could not create canonical source directory: ${agentsPath}`, {
+          cause: error,
+        });
+      }
+    }
+    agentsStats = lstatIfExists(agentsPath);
+  }
+  if (agentsStats?.isSymbolicLink()) {
+    throw new GuidanceError(`Canonical source directory must not be a symlink: ${agentsPath}`);
+  }
+  if (!agentsStats?.isDirectory()) {
+    throw new GuidanceError(`Canonical source path is not a directory: ${agentsPath}`);
+  }
+
+  const assertAgentsDirectoryUnchanged = () => {
+    const current = lstatIfExists(agentsPath);
+    if (
+      !current?.isDirectory() ||
+      current.isSymbolicLink() ||
+      !hasSameFileIdentity(current, agentsStats)
+    ) {
+      throw new GuidanceError(
+        `Canonical source directory changed during initialization: ${agentsPath}`,
+      );
+    }
+  };
+
+  const sourcePath = join(agentsPath, "guide.md");
+  const classifyExistingSource = () => {
+    const sourceStats = lstatIfExists(sourcePath);
+    if (!sourceStats) return null;
+    if (sourceStats.isSymbolicLink()) {
+      throw new GuidanceError(`Canonical source must not be a symlink: ${sourcePath}`);
+    }
+    if (!sourceStats.isFile()) {
+      throw new GuidanceError(`Canonical source is not a regular file: ${sourcePath}`);
+    }
+    return { created: false, root: projectRoot, sourcePath };
+  };
+
+  assertAgentsDirectoryUnchanged();
+  const existing = classifyExistingSource();
+  if (existing) return existing;
+
+  const temporaryPath = join(
+    agentsPath,
+    `.guide.md.${process.pid}.${randomUUID()}.tmp`,
+  );
+  let descriptor = null;
+  let temporaryIdentity = null;
+  const staged = {
+    committed: false,
+    item: { relativePath: SOURCE_PATH },
+    path: sourcePath,
+    temporaryIdentity: null,
+    temporaryPath,
+  };
+
+  try {
+    descriptor = openSync(temporaryPath, "wx", 0o666);
+    temporaryIdentity = fstatSync(descriptor);
+    staged.temporaryIdentity = temporaryIdentity;
+    writeFileSync(descriptor, INITIAL_GUIDE, "utf8");
+    fsyncSync(descriptor);
+    closeSync(descriptor);
+    descriptor = null;
+
+    assertAgentsDirectoryUnchanged();
+    if (!temporaryFileIsOriginal(staged)) {
+      throw new GuidanceError(`${SOURCE_PATH} temporary file changed during initialization.`);
+    }
+
+    const concurrentSource = classifyExistingSource();
+    if (concurrentSource) return concurrentSource;
+
+    try {
+      linkSync(temporaryPath, sourcePath);
+      staged.committed = true;
+    } catch (error) {
+      if (error && typeof error === "object" && error.code === "EEXIST") {
+        const racedSource = classifyExistingSource();
+        if (racedSource) return racedSource;
+      }
+      throw new GuidanceError(`Could not atomically create ${SOURCE_PATH}.`, { cause: error });
+    }
+    removeStagedTemporaryOrThrow(staged);
+    return { created: true, root: projectRoot, sourcePath };
+  } catch (error) {
+    if (error instanceof GuidanceError) throw error;
+    throw new GuidanceError(`Could not initialize ${SOURCE_PATH}.`, { cause: error });
+  } finally {
+    if (descriptor !== null) {
+      try {
+        closeSync(descriptor);
+      } catch {
+        // Preserve the initialization failure; cleanup is best-effort.
+      }
+    }
+    if (temporaryIdentity) removeStagedTemporary(staged);
+  }
+}
+
 function parentPathIssue(root, targetPath) {
   const segments = dirname(targetPath).split("/").filter((segment) => segment !== ".");
   let current = root;
@@ -396,6 +533,15 @@ function removeStagedTemporary(staged) {
   }
 }
 
+function removeStagedTemporaryOrThrow(staged) {
+  removeStagedTemporary(staged);
+  if (temporaryFileIsOriginal(staged)) {
+    throw new GuidanceError(
+      `Could not remove staged temporary file for ${staged.item.relativePath}.`,
+    );
+  }
+}
+
 function stageAtomicWrite(root, item) {
   assertTargetUnchanged(root, item);
   const path = absoluteTargetPath(root, item.relativePath);
@@ -475,7 +621,7 @@ function commitStagedWrite(root, staged) {
     if (item.originalContents === null) {
       linkSync(temporaryPath, path);
       staged.committed = true;
-      rmSync(temporaryPath);
+      removeStagedTemporaryOrThrow(staged);
       return;
     }
     renameSync(temporaryPath, path);

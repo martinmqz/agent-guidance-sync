@@ -1,8 +1,11 @@
 import {
   GuidanceError,
+  SOURCE_PATH,
   VERSION,
   checkProject,
+  findInitializationRoot,
   findProjectRoot,
+  initProject,
   syncProject,
 } from "./index.mjs";
 
@@ -11,12 +14,14 @@ const HELP = `agent-guidance ${VERSION}
 Deterministically sync canonical coding-agent guidance.
 
 Usage:
+  agent-guidance init
   agent-guidance sync [--adopt | --force]
   agent-guidance check
   agent-guidance --help
   agent-guidance --version
 
 Commands:
+  init    Create .agents/guide.md without overwriting an existing source.
   sync    Create or refresh generated guidance files.
   check   Exit non-zero when guidance is missing, stale, unmanaged, or unsafe.
 
@@ -41,7 +46,7 @@ function parseArguments(argv) {
   }
   if (helpRequested) {
     const commandHelp =
-      argv.length === 2 && ["sync", "check"].includes(argv[0]) && ["--help", "-h"].includes(argv[1]);
+      argv.length === 2 && ["init", "sync", "check"].includes(argv[0]) && ["--help", "-h"].includes(argv[1]);
     if (argv.length === 1 || commandHelp) return { command: "help" };
     throw new UsageError("--help cannot be combined with other options.");
   }
@@ -51,7 +56,7 @@ function parseArguments(argv) {
   }
 
   const [command, ...options] = argv;
-  if (!["sync", "check"].includes(command)) {
+  if (!["init", "sync", "check"].includes(command)) {
     throw new UsageError(`Unknown command: ${command}`);
   }
   const unknownOptions = options.filter((option) => !["--adopt", "--force"].includes(option));
@@ -62,8 +67,8 @@ function parseArguments(argv) {
   if (duplicateOption) {
     throw new UsageError(`Duplicate option: ${duplicateOption}`);
   }
-  if (command === "check" && options.length > 0) {
-    throw new UsageError("check does not accept --adopt or --force.");
+  if (["init", "check"].includes(command) && options.length > 0) {
+    throw new UsageError(`${command} does not accept --adopt or --force.`);
   }
   if (options.includes("--adopt") && options.includes("--force")) {
     throw new UsageError("--adopt and --force are mutually exclusive.");
@@ -114,6 +119,19 @@ export function runCli(
     }
     if (parsed.command === "version") {
       writeOutput(VERSION);
+      return 0;
+    }
+
+    if (parsed.command === "init") {
+      const root = findInitializationRoot(cwd);
+      const result = initProject(root);
+      if (!result.created) {
+        writeOutput(`Agent guidance is already initialized at ${SOURCE_PATH}.`);
+        return 0;
+      }
+      writeOutput(
+        `Initialized agent guidance at ${SOURCE_PATH}.\nEdit it, then run agent-guidance sync.`,
+      );
       return 0;
     }
 
