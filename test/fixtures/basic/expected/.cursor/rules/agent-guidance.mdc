@@ -1,0 +1,12 @@
+---
+description: Repository-wide guidance generated from .agents/guide.md
+alwaysApply: true
+---
+
+<!-- agent-guidance-sync:generated:v1 source=".agents/guide.md" target=".cursor/rules/agent-guidance.mdc" -->
+
+# Fixture agent guide
+
+Follow the canonical instructions.
+
+- Keep output deterministic.
