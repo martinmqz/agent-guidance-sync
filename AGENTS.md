@@ -2,8 +2,9 @@
 
 # Agent Guidance Sync Contributor Guide
 
-Canonical coding-agent guidance lives in `.agents/guide.md`. Generated agent
-files are outputs; do not edit them directly.
+Canonical coding-agent guidance lives in `.agents/guide.md`,
+`.agents/config.yaml`, and `.agents/rules/**/*.md`. Generated agent files are
+outputs; do not edit them directly.
 
 ## Development
 
@@ -13,6 +14,8 @@ files are outputs; do not edit them directly.
   atomic-write behavior are security boundaries, not convenience features.
 - Keep the runtime dependency-free unless a dependency has a clear correctness
   or portability benefit.
+- Keep the canonical schema vendor-neutral. Agent-specific frontmatter belongs
+  only in generated adapters.
 - Add focused fixtures and negative tests for every filesystem safety behavior.
 - Run `npm test` and `node bin/agent-guidance.mjs check` before handoff.
 

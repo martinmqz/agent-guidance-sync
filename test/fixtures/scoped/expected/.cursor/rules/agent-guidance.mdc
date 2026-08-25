@@ -1,0 +1,16 @@
+---
+description: Repository-wide guidance generated from .agents/guide.md
+alwaysApply: true
+---
+
+<!-- agent-guidance-sync:generated:v1 source=".agents/guide.md" target=".cursor/rules/agent-guidance.mdc" -->
+
+# Scoped Fixture Guide
+
+Repository-wide fixture guidance.
+
+<!-- agent-guidance-sync:rule source=".agents/rules/quality.md" -->
+
+# Quality
+
+Keep changes focused and deterministic.

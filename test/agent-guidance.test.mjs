@@ -18,13 +18,15 @@ import { dirname, join, relative, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import test from "node:test";
 import { setTimeout as delay } from "node:timers/promises";
-import { INITIAL_GUIDE } from "../src/index.mjs";
+import { INITIAL_CONFIG, INITIAL_GUIDE, initProject } from "../src/index.mjs";
 
 const packageRoot = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 const packageMetadata = JSON.parse(readFileSync(join(packageRoot, "package.json"), "utf8"));
 const cliPath = join(packageRoot, "bin", "agent-guidance.mjs");
 const fixtureRoot = join(packageRoot, "test", "fixtures", "basic");
 const expectedRoot = join(fixtureRoot, "expected");
+const scopedFixtureRoot = join(packageRoot, "test", "fixtures", "scoped");
+const scopedExpectedRoot = join(scopedFixtureRoot, "expected");
 const generatedPaths = [
   "AGENTS.md",
   "CLAUDE.md",
@@ -118,8 +120,11 @@ test("initializes the Git repository root without generating targets", (t) => {
 
   const init = runCli(nested, "init");
   assert.equal(init.status, 0, init.stderr);
-  assert.match(init.stdout, /Initialized agent guidance at \.agents\/guide\.md/);
+  assert.match(init.stdout, /Initialized agent guidance/);
+  assert.match(init.stdout, /created: \.agents\/guide\.md/);
+  assert.match(init.stdout, /created: \.agents\/config\.yaml/);
   assert.equal(read(root, ".agents/guide.md"), INITIAL_GUIDE);
+  assert.equal(read(root, ".agents/config.yaml"), INITIAL_CONFIG);
   assert.equal(lstatIfExists(join(nested, ".agents")), null);
   for (const relativePath of generatedPaths) {
     assert.equal(lstatIfExists(join(root, relativePath)), null);
@@ -135,6 +140,7 @@ test("initializes the current directory when no Git repository is present", (t) 
   const init = runCli(nested, "init");
   assert.equal(init.status, 0, init.stderr);
   assert.equal(read(nested, ".agents/guide.md"), INITIAL_GUIDE);
+  assert.equal(read(nested, ".agents/config.yaml"), INITIAL_CONFIG);
   assert.equal(lstatIfExists(join(root, ".agents")), null);
 });
 
@@ -145,8 +151,87 @@ test("init is idempotent and never overwrites an existing canonical source", (t)
 
   const init = runCli(root, "init");
   assert.equal(init.status, 0, init.stderr);
-  assert.match(init.stdout, /already initialized/);
+  assert.match(init.stdout, /created: \.agents\/config\.yaml/);
   assert.equal(read(root, ".agents/guide.md"), existingGuide);
+  assert.equal(read(root, ".agents/config.yaml"), INITIAL_CONFIG);
+
+  const secondInit = runCli(root, "init");
+  assert.equal(secondInit.status, 0, secondInit.stderr);
+  assert.match(secondInit.stdout, /already initialized/);
+  assert.equal(read(root, ".agents/guide.md"), existingGuide);
+});
+
+test(
+  "init can add missing config without reading an existing guide",
+  { skip: process.platform === "win32" },
+  (t) => {
+    const root = temporaryDirectory(t);
+    const guidePath = join(root, ".agents", "guide.md");
+    write(root, ".agents/guide.md", "# Existing unreadable guide\n");
+    chmodSync(guidePath, 0o000);
+
+    let init;
+    try {
+      init = runCli(root, "init");
+    } finally {
+      chmodSync(guidePath, 0o600);
+    }
+
+    assert.equal(init.status, 0, init.stderr);
+    assert.match(init.stdout, /created: \.agents\/config\.yaml/);
+    assert.equal(read(root, ".agents/guide.md"), "# Existing unreadable guide\n");
+    assert.equal(read(root, ".agents/config.yaml"), INITIAL_CONFIG);
+  },
+);
+
+test(
+  "init creates the canonical source directory with bounded permissions",
+  { skip: process.platform === "win32" },
+  (t) => {
+    const root = temporaryDirectory(t);
+    const previousUmask = process.umask(0o000);
+    let init;
+    try {
+      init = runCli(root, "init");
+    } finally {
+      process.umask(previousUmask);
+    }
+
+    assert.equal(init.status, 0, init.stderr);
+    assert.equal(statSync(join(root, ".agents")).mode & 0o777, 0o755);
+  },
+);
+
+test("init preserves its public result contract while exposing created paths", (t) => {
+  const root = temporaryDirectory(t);
+  const initialized = initProject(root);
+  assert.equal(initialized.created, true);
+  assert.equal(initialized.createdAny, true);
+  assert.deepEqual(initialized.createdPaths, [".agents/guide.md", ".agents/config.yaml"]);
+  assert.equal(initialized.sourcePath, join(root, ".agents", "guide.md"));
+
+  const repeated = initProject(root);
+  assert.equal(repeated.created, false);
+  assert.equal(repeated.createdAny, false);
+  assert.deepEqual(repeated.createdPaths, []);
+  assert.deepEqual(repeated.existingPaths, [".agents/guide.md", ".agents/config.yaml"]);
+
+  const migrationRoot = temporaryDirectory(t);
+  write(migrationRoot, ".agents/guide.md", "# Existing guide\n");
+  const migrated = initProject(migrationRoot);
+  assert.equal(migrated.created, false);
+  assert.equal(migrated.createdAny, true);
+  assert.deepEqual(migrated.createdPaths, [".agents/config.yaml"]);
+});
+
+test("concurrent init calls converge without overwriting canonical files", async (t) => {
+  const root = temporaryDirectory(t);
+  const attempts = Array.from({ length: 12 }, () => runCliAsync(root, "init").completed);
+  const results = await Promise.all(attempts);
+  for (const result of results) assert.equal(result.status, 0, result.stderr);
+  assert.equal(read(root, ".agents/guide.md"), INITIAL_GUIDE);
+  assert.equal(read(root, ".agents/config.yaml"), INITIAL_CONFIG);
+  assert.equal(listFiles(root).some((path) => path.endsWith(".tmp")), false);
 });
 
 test("init rejects symlinked canonical source paths without following them", (t) => {
@@ -169,6 +254,16 @@ test("init rejects symlinked canonical source paths without following them", (t)
   assert.equal(fileResult.status, 1);
   assert.match(fileResult.stderr, /Canonical source must not be a symlink/);
   assert.equal(readFileSync(outsideGuide, "utf8"), "# Outside guide\n");
+
+  const configRoot = temporaryDirectory(t);
+  mkdirSync(join(configRoot, ".agents"));
+  if (!createSymlinkOrSkip(t, outsideGuide, join(configRoot, ".agents", "config.yaml"), "file")) {
+    return;
+  }
+  const configResult = runCli(configRoot, "init");
+  assert.equal(configResult.status, 1);
+  assert.match(configResult.stderr, /Canonical source must not be a symlink/);
+  assert.equal(lstatIfExists(join(configRoot, ".agents", "guide.md")), null);
 });
 
 test("init rejects non-directory and non-regular canonical source paths", (t) => {
@@ -187,6 +282,13 @@ test("init rejects non-directory and non-regular canonical source paths", (t) =>
   assert.equal(fileResult.status, 1);
   assert.match(fileResult.stderr, /Canonical source is not a regular file/);
   assert.equal(lstatSync(join(fileRoot, ".agents", "guide.md")).isDirectory(), true);
+
+  const configRoot = temporaryDirectory(t);
+  mkdirSync(join(configRoot, ".agents", "config.yaml"), { recursive: true });
+  const configResult = runCli(configRoot, "init");
+  assert.equal(configResult.status, 1);
+  assert.match(configResult.stderr, /Canonical source is not a regular file/);
+  assert.equal(lstatIfExists(join(configRoot, ".agents", "guide.md")), null);
 });
 
 test("generates deterministic repository-wide guidance for every supported agent", (t) => {
@@ -197,7 +299,7 @@ test("generates deterministic repository-wide guidance for every supported agent
   for (const relativePath of generatedPaths) {
     assert.match(initialCheck.stderr, new RegExp(`missing: ${relativePath.replaceAll(".", "\\.")}`));
   }
-  assert.deepEqual(listFiles(root), [".agents/guide.md"]);
+  assert.deepEqual(listFiles(root), [".agents/config.yaml", ".agents/guide.md"]);
 
   const sync = runCli(root, "sync");
   assert.equal(sync.status, 0, sync.stderr);
@@ -219,6 +321,528 @@ test("generates deterministic repository-wide guidance for every supported agent
   const secondSync = runCli(root, "sync");
   assert.equal(secondSync.status, 0, secondSync.stderr);
   assert.match(secondSync.stdout, /already in sync/);
+});
+
+test("generates deterministic always and path-activated rule adapters", (t) => {
+  const root = temporaryDirectory(t);
+  cpSync(join(scopedFixtureRoot, ".agents"), join(root, ".agents"), { recursive: true });
+  const scopedGeneratedPaths = listFiles(scopedExpectedRoot);
+
+  const initialCheck = runCli(root, "check");
+  assert.equal(initialCheck.status, 1);
+  for (const relativePath of scopedGeneratedPaths) {
+    assert.match(initialCheck.stderr, new RegExp(`missing: ${relativePath.replaceAll(".", "\\.")}`));
+  }
+
+  const sync = runCli(root, "sync");
+  assert.equal(sync.status, 0, sync.stderr);
+  for (const relativePath of scopedGeneratedPaths) {
+    assert.equal(read(root, relativePath), read(scopedExpectedRoot, relativePath));
+  }
+  assert.equal(runCli(root, "check").status, 0);
+  assert.match(read(root, "AGENTS.md"), /agent-guidance-sync:rule source="\.agents\/rules\/quality\.md"/);
+  assert.doesNotMatch(read(root, "AGENTS.md"), /React Components/);
+});
+
+test("removes obsolete owned scoped outputs and preserves neighboring files", (t) => {
+  const root = temporaryDirectory(t);
+  cpSync(join(scopedFixtureRoot, ".agents"), join(root, ".agents"), { recursive: true });
+  write(root, ".cursor/rules/personal.mdc", "# Personal Cursor guidance\n");
+  write(root, ".github/instructions/personal.instructions.md", "# Personal Copilot guidance\n");
+  assert.equal(runCli(root, "sync").status, 0);
+
+  rmSync(join(root, ".agents", "rules", "frontend", "react.md"));
+  const check = runCli(root, "check");
+  assert.equal(check.status, 1);
+  assert.match(check.stderr, /obsolete: \.cursor\/rules\/agent-guidance\/frontend\/react\.mdc/);
+  assert.match(
+    check.stderr,
+    /obsolete: \.github\/instructions\/agent-guidance\/frontend\/react\.instructions\.md/,
+  );
+
+  const sync = runCli(root, "sync");
+  assert.equal(sync.status, 0, sync.stderr);
+  assert.equal(lstatIfExists(join(root, ".cursor/rules/agent-guidance/frontend/react.mdc")), null);
+  assert.equal(
+    lstatIfExists(
+      join(root, ".github/instructions/agent-guidance/frontend/react.instructions.md"),
+    ),
+    null,
+  );
+  assert.equal(read(root, ".cursor/rules/personal.mdc"), "# Personal Cursor guidance\n");
+  assert.equal(
+    read(root, ".github/instructions/personal.instructions.md"),
+    "# Personal Copilot guidance\n",
+  );
+  assert.equal(runCli(root, "check").status, 0);
+});
+
+test("does not remove a symlink substituted for an obsolete scoped output", (t) => {
+  const root = temporaryDirectory(t);
+  cpSync(join(scopedFixtureRoot, ".agents"), join(root, ".agents"), { recursive: true });
+  assert.equal(runCli(root, "sync").status, 0);
+  const staleCursorPath = join(root, ".cursor/rules/agent-guidance/frontend/react.mdc");
+  const outside = join(temporaryDirectory(t, "agent-guidance-obsolete-outside-"), "rule.mdc");
+  writeFileSync(outside, "outside\n");
+  rmSync(join(root, ".agents", "rules", "frontend", "react.md"));
+  rmSync(staleCursorPath);
+  if (!createSymlinkOrSkip(t, outside, staleCursorPath, "file")) return;
+
+  const sync = runCli(root, "sync", "--force");
+  assert.equal(sync.status, 1);
+  assert.match(sync.stderr, /unsafe: \.cursor\/rules\/agent-guidance\/frontend\/react\.mdc/);
+  assert.equal(lstatSync(staleCursorPath).isSymbolicLink(), true);
+  assert.equal(readFileSync(outside, "utf8"), "outside\n");
+  assert.ok(
+    lstatIfExists(
+      join(root, ".github/instructions/agent-guidance/frontend/react.instructions.md"),
+    ),
+  );
+});
+
+test("stale-output discovery never traverses parent directory symlinks", (t) => {
+  const cursorRoot = temporaryRepo(t);
+  writeFileSync(
+    join(cursorRoot, ".agents", "config.yaml"),
+    `version: 1
+adapters:
+  agents: true
+  claude: true
+  cursor: false
+  copilot: true
+`,
+  );
+  const outsideCursor = temporaryDirectory(t, "agent-guidance-disabled-cursor-outside-");
+  write(outsideCursor, "rules/agent-guidance.mdc", read(expectedRoot, ".cursor/rules/agent-guidance.mdc"));
+  if (!createSymlinkOrSkip(t, outsideCursor, join(cursorRoot, ".cursor"), "dir")) return;
+
+  const cursorSync = runCli(cursorRoot, "sync", "--force");
+  assert.equal(cursorSync.status, 1);
+  assert.match(cursorSync.stderr, /generated path traverses a symlink: \.cursor/);
+  assert.equal(lstatIfExists(join(cursorRoot, "AGENTS.md")), null);
+  assert.equal(
+    read(outsideCursor, "rules/agent-guidance.mdc"),
+    read(expectedRoot, ".cursor/rules/agent-guidance.mdc"),
+  );
+
+  const namespaceRoot = temporaryRepo(t);
+  const outsideInstructions = temporaryDirectory(
+    t,
+    "agent-guidance-copilot-namespace-outside-",
+  );
+  const stalePath = "agent-guidance/stale.instructions.md";
+  write(
+    outsideInstructions,
+    stalePath,
+    '<!-- agent-guidance-sync:generated:v1 source=".agents/rules/stale.md" target=".github/instructions/agent-guidance/stale.instructions.md" -->\n',
+  );
+  mkdirSync(join(namespaceRoot, ".github"));
+  if (
+    !createSymlinkOrSkip(
+      t,
+      outsideInstructions,
+      join(namespaceRoot, ".github", "instructions"),
+      "dir",
+    )
+  ) {
+    return;
+  }
+
+  const namespaceSync = runCli(namespaceRoot, "sync", "--force");
+  assert.equal(namespaceSync.status, 1);
+  assert.match(namespaceSync.stderr, /generated path traverses a symlink: \.github\/instructions/);
+  assert.equal(lstatIfExists(join(namespaceRoot, "AGENTS.md")), null);
+  assert.match(read(outsideInstructions, stalePath), /source="\.agents\/rules\/stale\.md"/);
+});
+
+test("obsolete ownership requires an exact version and source-to-target mapping", (t) => {
+  const root = temporaryRepo(t);
+  writeFileSync(
+    join(root, ".agents", "config.yaml"),
+    `version: 1
+adapters:
+  agents: false
+  claude: false
+  cursor: false
+  copilot: false
+`,
+  );
+  write(
+    root,
+    "AGENTS.md",
+    '<!-- agent-guidance-sync:generated:v1 source=".agents/rules/not-agents.md" target="AGENTS.md" -->\n',
+  );
+  const wrongSourcePath = ".cursor/rules/agent-guidance/wrong-source.mdc";
+  write(
+    root,
+    wrongSourcePath,
+    `---
+description: "Wrong source"
+globs: ["**/*.md"]
+alwaysApply: false
+---
+
+<!-- agent-guidance-sync:generated:v1 source=".agents/guide.md" target="${wrongSourcePath}" -->
+`,
+  );
+  const wrongVersionPath = ".cursor/rules/agent-guidance/wrong-version.mdc";
+  write(
+    root,
+    wrongVersionPath,
+    `---
+description: "Wrong version"
+globs: ["**/*.md"]
+alwaysApply: false
+---
+
+<!-- agent-guidance-sync:generated:v01 source=".agents/rules/wrong-version.md" target="${wrongVersionPath}" -->
+`,
+  );
+
+  const check = runCli(root, "check");
+  assert.equal(check.status, 1);
+  assert.match(check.stderr, /unmanaged: \.cursor\/rules\/agent-guidance\/wrong-source\.mdc/);
+  assert.match(check.stderr, /unmanaged: \.cursor\/rules\/agent-guidance\/wrong-version\.mdc/);
+  assert.doesNotMatch(check.stderr, /obsolete/);
+
+  const sync = runCli(root, "sync", "--force");
+  assert.equal(sync.status, 1);
+  assert.ok(lstatIfExists(join(root, "AGENTS.md")));
+  assert.ok(lstatIfExists(join(root, wrongSourcePath)));
+  assert.ok(lstatIfExists(join(root, wrongVersionPath)));
+});
+
+test("blocks all writes for unmanaged files inside reserved generated namespaces", (t) => {
+  const root = temporaryDirectory(t);
+  cpSync(join(scopedFixtureRoot, ".agents"), join(root, ".agents"), { recursive: true });
+  assert.equal(runCli(root, "sync").status, 0);
+  const originalAgents = read(root, "AGENTS.md");
+  const roguePath = ".cursor/rules/agent-guidance/rogue.mdc";
+  write(root, roguePath, "# Unmanaged reserved file\n");
+  writeFileSync(join(root, ".agents", "guide.md"), "# Updated guide\n");
+
+  for (const command of [["sync"], ["sync", "--force"]]) {
+    const result = runCli(root, ...command);
+    assert.equal(result.status, 1);
+    assert.match(result.stderr, /unmanaged: \.cursor\/rules\/agent-guidance\/rogue\.mdc/);
+    assert.equal(read(root, roguePath), "# Unmanaged reserved file\n");
+    assert.equal(read(root, "AGENTS.md"), originalAgents);
+  }
+});
+
+test("disabled adapters remove only their exactly owned outputs", (t) => {
+  const root = temporaryDirectory(t);
+  cpSync(join(scopedFixtureRoot, ".agents"), join(root, ".agents"), { recursive: true });
+  write(root, ".cursor/rules/personal.mdc", "# Personal Cursor guidance\n");
+  write(root, ".github/instructions/personal.instructions.md", "# Personal Copilot guidance\n");
+  assert.equal(runCli(root, "sync").status, 0);
+
+  writeFileSync(
+    join(root, ".agents", "config.yaml"),
+    `version: 1
+adapters:
+  agents: true
+  claude: true
+  cursor: false
+  copilot: false
+`,
+  );
+  const check = runCli(root, "check");
+  assert.equal(check.status, 1);
+  assert.match(check.stderr, /obsolete: \.cursor\/rules\/agent-guidance\.mdc/);
+  assert.match(check.stderr, /obsolete: \.github\/copilot-instructions\.md/);
+
+  const sync = runCli(root, "sync");
+  assert.equal(sync.status, 0, sync.stderr);
+  assert.ok(lstatIfExists(join(root, "AGENTS.md")));
+  assert.ok(lstatIfExists(join(root, "CLAUDE.md")));
+  assert.equal(lstatIfExists(join(root, ".cursor/rules/agent-guidance.mdc")), null);
+  assert.equal(lstatIfExists(join(root, ".cursor/rules/agent-guidance/frontend/react.mdc")), null);
+  assert.equal(lstatIfExists(join(root, ".github/copilot-instructions.md")), null);
+  assert.equal(
+    lstatIfExists(
+      join(root, ".github/instructions/agent-guidance/frontend/react.instructions.md"),
+    ),
+    null,
+  );
+  assert.equal(read(root, ".cursor/rules/personal.mdc"), "# Personal Cursor guidance\n");
+  assert.equal(
+    read(root, ".github/instructions/personal.instructions.md"),
+    "# Personal Copilot guidance\n",
+  );
+  assert.equal(runCli(root, "check").status, 0);
+});
+
+test("rejects invalid config and rule schemas before generating files", (t) => {
+  const missingConfigRoot = temporaryRepo(t);
+  rmSync(join(missingConfigRoot, ".agents", "config.yaml"));
+  const missingConfig = runCli(missingConfigRoot, "check");
+  assert.equal(missingConfig.status, 1);
+  assert.match(missingConfig.stderr, /Missing canonical config/);
+  assert.match(missingConfig.stderr, /agent-guidance init/);
+  assert.equal(lstatIfExists(join(missingConfigRoot, "AGENTS.md")), null);
+
+  const invalidConfigs = [
+    ["version: 2\n", /needs version: 1/],
+    ["version: 01\n", /needs version: 1/],
+    [
+      `adapters:
+  agents: true
+version: 1
+  claude: true
+  cursor: true
+  copilot: true
+`,
+      /Invalid \.agents\/config\.yaml line/,
+    ],
+    [
+      `version: 1
+adapters:
+  agents: false
+  claude: true
+  cursor: true
+  copilot: true
+`,
+      /Claude adapter requires the AGENTS\.md adapter/,
+    ],
+  ];
+  for (const [contents, expectedError] of invalidConfigs) {
+    const root = temporaryRepo(t);
+    writeFileSync(join(root, ".agents", "config.yaml"), contents);
+    const check = runCli(root, "check");
+    assert.equal(check.status, 1);
+    assert.match(check.stderr, expectedError);
+    assert.deepEqual(
+      listFiles(root).filter((path) => !path.startsWith(".agents/")),
+      [],
+    );
+  }
+
+  const invalidRules = [
+    [
+      "bad-activation.md",
+      `---
+description: Invalid activation
+activation: sometimes
+---
+# Invalid
+`,
+      /needs activation: always\|path/,
+    ],
+    [
+      "missing-paths.md",
+      `---
+description: Missing paths
+activation: path
+---
+# Missing Paths
+`,
+      /needs at least one path/,
+    ],
+    [
+      "unsafe-path.md",
+      `---
+description: Unsafe path
+activation: path
+paths:
+  - "../outside/**"
+---
+# Unsafe Path
+`,
+      /unsafe or non-portable path glob/,
+    ],
+    [
+      "invalid-quote.md",
+      `---
+description: 'Broken' trailing'
+activation: always
+---
+# Invalid Quote
+`,
+      /invalid quoted string/,
+    ],
+    [
+      "always-paths.md",
+      `---
+description: Always with paths
+activation: always
+paths:
+---
+# Always Paths
+`,
+      /must not declare paths/,
+    ],
+    [
+      "indented-heading.md",
+      `---
+description: Indented code heading
+activation: always
+---
+    # Not a heading
+`,
+      /needs a level-one heading/,
+    ],
+    [
+      "control-path.md",
+      `---
+description: Control path
+activation: path
+paths:
+  - apps/\u0007/**
+---
+# Control Path
+`,
+      /unsafe or non-portable path glob/,
+    ],
+    [
+      "inline-comment.md",
+      `---
+description: Inline comment
+activation: path
+paths:
+  - apps/**/*.tsx # frontend
+---
+# Inline Comment
+`,
+      /unsupported plain-scalar YAML syntax/,
+    ],
+    [
+      "windows-path.md",
+      `---
+description: Windows-invalid paths
+activation: path
+paths:
+  - "apps/feature:legacy/**"
+---
+# Windows-invalid Paths
+`,
+      /unsafe or non-portable path glob/,
+    ],
+    [
+      "trailing-dot-path.md",
+      `---
+description: Trailing dot path
+activation: path
+paths:
+  - "apps/legacy./**"
+---
+# Trailing Dot Path
+`,
+      /unsafe or non-portable path glob/,
+    ],
+    [
+      "yaml-flow-collection.md",
+      `---
+description: [Shared, testing]
+activation: always
+---
+# YAML Flow Collection
+`,
+      /unsupported plain-scalar YAML syntax/,
+    ],
+    [
+      "yaml-anchor.md",
+      `---
+description: &shared Shared
+activation: always
+---
+# YAML Anchor
+`,
+      /unsupported plain-scalar YAML syntax/,
+    ],
+    [
+      "yaml-colon.md",
+      `---
+description: Shared:
+activation: always
+---
+# YAML Colon
+`,
+      /unsupported plain-scalar YAML syntax/,
+    ],
+    [
+      "yaml-nested-sequence.md",
+      `---
+description: Nested sequence
+activation: path
+paths:
+  - - apps/**
+---
+# YAML Nested Sequence
+`,
+      /unsupported plain-scalar YAML syntax/,
+    ],
+    [
+      "windows-device-path.md",
+      `---
+description: Windows device path
+activation: path
+paths:
+  - "packages/NUL.txt/**"
+---
+# Windows Device Path
+`,
+      /unsafe or non-portable path glob/,
+    ],
+  ];
+  for (const [fileName, contents, expectedError] of invalidRules) {
+    const root = temporaryRepo(t);
+    write(root, `.agents/rules/${fileName}`, contents);
+    const check = runCli(root, "check");
+    assert.equal(check.status, 1);
+    assert.match(check.stderr, expectedError);
+    if (contents.includes("\u0007")) {
+      assert.equal(check.stderr.includes("\u0007"), false);
+      assert.match(check.stderr, /\\u0007/);
+    }
+    assert.equal(lstatIfExists(join(root, "AGENTS.md")), null);
+  }
+});
+
+test("escapes untrusted filesystem names before writing terminal diagnostics", (t) => {
+  if (process.platform === "win32") {
+    t.skip("Windows does not support the control-character fixture name.");
+    return;
+  }
+
+  const root = temporaryRepo(t);
+  const unsafeName = "\u001b[31mspoof\nnext\u2028split\u202ereordered.mdc";
+  write(root, `.cursor/rules/agent-guidance/${unsafeName}`, "# Unmanaged\n");
+
+  const check = runCli(root, "check");
+  assert.equal(check.status, 1);
+  assert.equal(check.stderr.includes("\u001b"), false);
+  assert.equal(check.stderr.includes("\nnext"), false);
+  assert.equal(check.stderr.includes("\u2028"), false);
+  assert.equal(check.stderr.includes("\u202e"), false);
+  assert.match(check.stderr, /\\u001b\[31mspoof\\nnext\\u2028split\\u202ereordered\.mdc/);
+});
+
+test("rejects symlinked config and rule sources without following them", (t) => {
+  const outsideRoot = temporaryDirectory(t, "agent-guidance-canonical-outside-");
+  const outsideConfig = join(outsideRoot, "config.yaml");
+  writeFileSync(outsideConfig, INITIAL_CONFIG);
+
+  const configRoot = temporaryRepo(t);
+  rmSync(join(configRoot, ".agents", "config.yaml"));
+  if (!createSymlinkOrSkip(t, outsideConfig, join(configRoot, ".agents", "config.yaml"), "file")) {
+    return;
+  }
+  const configCheck = runCli(configRoot, "check");
+  assert.equal(configCheck.status, 1);
+  assert.match(configCheck.stderr, /Canonical config must not be a symlink/);
+  assert.equal(lstatIfExists(join(configRoot, "AGENTS.md")), null);
+
+  const rulesRoot = temporaryRepo(t);
+  const outsideRules = join(outsideRoot, "rules");
+  mkdirSync(outsideRules);
+  writeFileSync(join(outsideRules, "outside.md"), "outside\n");
+  if (!createSymlinkOrSkip(t, outsideRules, join(rulesRoot, ".agents", "rules"), "dir")) return;
+  const rulesCheck = runCli(rulesRoot, "check");
+  assert.equal(rulesCheck.status, 1);
+  assert.match(rulesCheck.stderr, /Canonical rules directory must not be a symlink/);
+  assert.equal(readFileSync(join(outsideRules, "outside.md"), "utf8"), "outside\n");
+  assert.equal(lstatIfExists(join(rulesRoot, "AGENTS.md")), null);
 });
 
 test("leaves unrelated files beside generated targets untouched", (t) => {
@@ -344,6 +968,34 @@ test("requires the exact target-specific ownership marker", (t) => {
   assert.equal(sync.status, 1);
   assert.match(sync.stderr, /unmanaged: AGENTS\.md/);
   assert.equal(read(root, "AGENTS.md").startsWith(wrongMarker), true);
+});
+
+test("adapter toggles never turn an unmanaged header position into ownership", (t) => {
+  const root = temporaryRepo(t);
+  const marker = read(expectedRoot, "AGENTS.md").split("\n")[0];
+  const unmanaged = `---\ncustom: true\n---\n\n${marker}\n\n# Handwritten guidance\n`;
+  write(root, "AGENTS.md", unmanaged);
+
+  const enabledSync = runCli(root, "sync");
+  assert.equal(enabledSync.status, 1);
+  assert.match(enabledSync.stderr, /unmanaged: AGENTS\.md/);
+  assert.equal(read(root, "AGENTS.md"), unmanaged);
+
+  writeFileSync(
+    join(root, ".agents", "config.yaml"),
+    `version: 1
+adapters:
+  agents: false
+  claude: false
+  cursor: false
+  copilot: false
+`,
+  );
+  const disabledCheck = runCli(root, "check");
+  assert.equal(disabledCheck.status, 0, disabledCheck.stderr);
+  const disabledSync = runCli(root, "sync");
+  assert.equal(disabledSync.status, 0, disabledSync.stderr);
+  assert.equal(read(root, "AGENTS.md"), unmanaged);
 });
 
 test("does not claim a marker shown as content instead of the generated header", (t) => {
@@ -613,11 +1265,11 @@ test("reports missing sources and invalid CLI combinations without writing", (t)
 
   const commandHelp = runCli(root, "sync", "--help");
   assert.equal(commandHelp.status, 0, commandHelp.stderr);
-  assert.match(commandHelp.stdout, /missing, stale, unmanaged, or unsafe/);
+  assert.match(commandHelp.stdout, /missing, stale, obsolete, unmanaged, or unsafe/);
 
   const initHelp = runCli(root, "init", "--help");
   assert.equal(initHelp.status, 0, initHelp.stderr);
-  assert.match(initHelp.stdout, /without overwriting an existing source/);
+  assert.match(initHelp.stdout, /without overwriting existing files/);
   assert.deepEqual(listFiles(root), []);
 });
 
@@ -689,6 +1341,7 @@ test("packs, installs, and runs the published artifact", (t) => {
   });
   assert.equal(init.status, 0, init.stderr);
   assert.equal(read(consumerRoot, ".agents/guide.md"), INITIAL_GUIDE);
+  assert.equal(read(consumerRoot, ".agents/config.yaml"), INITIAL_CONFIG);
 
   const sync = spawnSync(process.execPath, [installedCli, "sync"], {
     cwd: consumerRoot,

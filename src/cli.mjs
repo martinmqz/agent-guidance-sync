@@ -21,9 +21,9 @@ Usage:
   agent-guidance --version
 
 Commands:
-  init    Create .agents/guide.md without overwriting an existing source.
+  init    Create missing canonical source files without overwriting existing files.
   sync    Create or refresh generated guidance files.
-  check   Exit non-zero when guidance is missing, stale, unmanaged, or unsafe.
+  check   Exit non-zero when guidance is missing, stale, obsolete, unmanaged, or unsafe.
 
 Options:
   --adopt    Claim unmanaged files only when their payload already matches.
@@ -79,22 +79,45 @@ function parseArguments(argv) {
   };
 }
 
+function terminalSafeInline(value) {
+  const namedEscapes = new Map([
+    ["\b", "\\b"],
+    ["\t", "\\t"],
+    ["\n", "\\n"],
+    ["\f", "\\f"],
+    ["\r", "\\r"],
+  ]);
+  return String(value).replace(/[\p{Cc}\p{Cf}\p{Zl}\p{Zp}]/gu, (character) => {
+    const namedEscape = namedEscapes.get(character);
+    if (namedEscape) return namedEscape;
+    const codePoint = character.codePointAt(0);
+    return codePoint <= 0xffff
+      ? `\\u${codePoint.toString(16).padStart(4, "0")}`
+      : `\\u{${codePoint.toString(16)}}`;
+  });
+}
+
 function itemDescription(item) {
+  const action = terminalSafeInline(item.action);
+  const relativePath = terminalSafeInline(item.relativePath);
+  const reason = terminalSafeInline(item.reason ?? "");
   switch (item.action) {
     case "create":
-      return `missing: ${item.relativePath}`;
+      return `missing: ${relativePath}`;
     case "update":
-      return `stale: ${item.relativePath}`;
+      return `stale: ${relativePath}`;
     case "adopt":
-      return `adopt: ${item.relativePath}`;
+      return `adopt: ${relativePath}`;
     case "replace":
-      return `replace: ${item.relativePath}`;
+      return `replace: ${relativePath}`;
+    case "delete":
+      return `obsolete: ${relativePath}`;
     case "conflict":
-      return `unmanaged: ${item.relativePath} (${item.reason})`;
+      return `unmanaged: ${relativePath} (${reason})`;
     case "unsafe":
-      return `unsafe: ${item.relativePath} (${item.reason})`;
+      return `unsafe: ${relativePath} (${reason})`;
     default:
-      return `${item.action}: ${item.relativePath}`;
+      return `${action}: ${relativePath}`;
   }
 }
 
@@ -125,13 +148,15 @@ export function runCli(
     if (parsed.command === "init") {
       const root = findInitializationRoot(cwd);
       const result = initProject(root);
-      if (!result.created) {
-        writeOutput(`Agent guidance is already initialized at ${SOURCE_PATH}.`);
+      if (result.createdPaths.length === 0) {
+        writeOutput(`Agent guidance is already initialized in .agents/.`);
         return 0;
       }
-      writeOutput(
-        `Initialized agent guidance at ${SOURCE_PATH}.\nEdit it, then run agent-guidance sync.`,
-      );
+      writeOutput("Initialized agent guidance.");
+      for (const relativePath of result.createdPaths) {
+        writeOutput(`- created: ${terminalSafeInline(relativePath)}`);
+      }
+      writeOutput(`Edit ${SOURCE_PATH}, then run agent-guidance sync.`);
       return 0;
     }
 
@@ -167,10 +192,12 @@ export function runCli(
     return 0;
   } catch (error) {
     if (error instanceof UsageError) {
-      writeError(`${error.message}\n\n${HELP.trimEnd()}`);
+      writeError(`${terminalSafeInline(error.message)}\n\n${HELP.trimEnd()}`);
       return 2;
     }
-    writeError(error instanceof GuidanceError || error instanceof Error ? error.message : String(error));
+    const message =
+      error instanceof GuidanceError || error instanceof Error ? error.message : String(error);
+    writeError(terminalSafeInline(message));
     return 1;
   }
 }
