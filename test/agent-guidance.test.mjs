@@ -8,6 +8,7 @@ import {
   mkdtempSync,
   readFileSync,
   readdirSync,
+  realpathSync,
   rmSync,
   statSync,
   symlinkSync,
@@ -110,6 +111,12 @@ function listFiles(root, current = root) {
     else files.push(relative(root, path).replaceAll("\\", "/"));
   }
   return files.sort();
+}
+
+function snapshotFiles(root) {
+  return Object.fromEntries(
+    listFiles(root).map((relativePath) => [relativePath, read(root, relativePath)]),
+  );
 }
 
 test("initializes the Git repository root without generating targets", (t) => {
@@ -806,7 +813,7 @@ test("escapes untrusted filesystem names before writing terminal diagnostics", (
   }
 
   const root = temporaryRepo(t);
-  const unsafeName = "\u001b[31mspoof\nnext\u2028split\u202ereordered.mdc";
+  const unsafeName = "\u001b[31mspoof\nnext\u2028split\u202ereordered\u{1d173}.mdc";
   write(root, `.cursor/rules/agent-guidance/${unsafeName}`, "# Unmanaged\n");
 
   const check = runCli(root, "check");
@@ -815,7 +822,25 @@ test("escapes untrusted filesystem names before writing terminal diagnostics", (
   assert.equal(check.stderr.includes("\nnext"), false);
   assert.equal(check.stderr.includes("\u2028"), false);
   assert.equal(check.stderr.includes("\u202e"), false);
-  assert.match(check.stderr, /\\u001b\[31mspoof\\nnext\\u2028split\\u202ereordered\.mdc/);
+  assert.equal(check.stderr.includes("\u{1d173}"), false);
+  assert.match(
+    check.stderr,
+    /\\u001b\[31mspoof\\nnext\\u2028split\\u202ereordered\\ud834\\udd73\.mdc/,
+  );
+
+  const jsonCheck = runCli(root, "check", "--json");
+  assert.equal(jsonCheck.status, 1);
+  assert.equal(jsonCheck.stderr, "");
+  assert.equal(jsonCheck.stdout.includes("\u001b"), false);
+  assert.equal(jsonCheck.stdout.includes("\u2028"), false);
+  assert.equal(jsonCheck.stdout.includes("\u202e"), false);
+  assert.equal(jsonCheck.stdout.includes("\u{1d173}"), false);
+  const jsonResult = JSON.parse(jsonCheck.stdout);
+  assert.ok(
+    jsonResult.plan.some(
+      ({ path }) => path === `.cursor/rules/agent-guidance/${unsafeName}`,
+    ),
+  );
 });
 
 test("rejects symlinked config and rule sources without following them", (t) => {
@@ -875,6 +900,155 @@ test("reports missing and stale files and repairs them with the same plan", (t) 
   assert.match(repair.stdout, /missing: CLAUDE\.md/);
   assert.equal(read(root, "AGENTS.md"), read(expectedRoot, "AGENTS.md"));
   assert.equal(read(root, "CLAUDE.md"), read(expectedRoot, "CLAUDE.md"));
+});
+
+test("dry-run plans creates, updates, and deletions without mutating files", (t) => {
+  const root = temporaryDirectory(t);
+  cpSync(join(scopedFixtureRoot, ".agents"), join(root, ".agents"), { recursive: true });
+  assert.equal(runCli(root, "sync").status, 0);
+
+  writeFileSync(join(root, ".agents", "guide.md"), "# Changed repository guidance\n");
+  rmSync(join(root, ".agents", "rules", "frontend", "react.md"));
+  const before = snapshotFiles(root);
+
+  const dryRun = runCli(root, "sync", "--dry-run");
+  assert.equal(dryRun.status, 0, dryRun.stderr);
+  assert.match(dryRun.stdout, /Dry run: agent guidance would be synced; no files were changed/);
+  assert.match(dryRun.stdout, /stale: AGENTS\.md/);
+  assert.match(
+    dryRun.stdout,
+    /obsolete: \.cursor\/rules\/agent-guidance\/frontend\/react\.mdc/,
+  );
+  assert.match(
+    dryRun.stdout,
+    /obsolete: \.github\/instructions\/agent-guidance\/frontend\/react\.instructions\.md/,
+  );
+  assert.deepEqual(snapshotFiles(root), before);
+  assert.equal(runCli(root, "check").status, 1);
+});
+
+test("dry-run honors takeover modes without claiming unmanaged files", (t) => {
+  const root = temporaryRepo(t);
+  write(root, "AGENTS.md", "# Existing unmanaged guidance\n");
+  const before = snapshotFiles(root);
+
+  const blocked = runCli(root, "sync", "--dry-run");
+  assert.equal(blocked.status, 1);
+  assert.match(blocked.stderr, /unmanaged: AGENTS\.md/);
+
+  const forced = runCli(root, "sync", "--force", "--dry-run");
+  assert.equal(forced.status, 0, forced.stderr);
+  assert.match(forced.stdout, /replace: AGENTS\.md/);
+  assert.deepEqual(snapshotFiles(root), before);
+});
+
+test("emits a stable JSON lifecycle without exposing plan internals", (t) => {
+  const root = temporaryDirectory(t);
+
+  const init = runCli(root, "init", "--json");
+  assert.equal(init.status, 0, init.stderr);
+  assert.equal(init.stderr, "");
+  assert.deepEqual(JSON.parse(init.stdout), {
+    schemaVersion: 1,
+    command: "init",
+    ok: true,
+    status: "initialized",
+    root: realpathSync(root),
+    createdPaths: [".agents/guide.md", ".agents/config.yaml"],
+    existingPaths: [],
+  });
+
+  const initialCheck = runCli(root, "check", "--json");
+  assert.equal(initialCheck.status, 1);
+  assert.equal(initialCheck.stderr, "");
+  const outOfSync = JSON.parse(initialCheck.stdout);
+  assert.equal(outOfSync.schemaVersion, 1);
+  assert.equal(outOfSync.command, "check");
+  assert.equal(outOfSync.ok, false);
+  assert.equal(outOfSync.status, "out-of-sync");
+  assert.deepEqual(
+    outOfSync.plan.map(({ action, path }) => [action, path]),
+    generatedPaths.map((path) => ["create", path]),
+  );
+  assert.deepEqual(Object.keys(outOfSync.plan[0]), ["action", "path"]);
+
+  const dryRun = runCli(root, "sync", "--dry-run", "--json");
+  assert.equal(dryRun.status, 0, dryRun.stderr);
+  const planned = JSON.parse(dryRun.stdout);
+  assert.equal(planned.status, "changes-planned");
+  assert.equal(planned.dryRun, true);
+  assert.equal(planned.takeover, "none");
+  assert.deepEqual(planned.plan, outOfSync.plan);
+  assert.equal(lstatIfExists(join(root, "AGENTS.md")), null);
+
+  const sync = runCli(root, "sync", "--json");
+  assert.equal(sync.status, 0, sync.stderr);
+  const synced = JSON.parse(sync.stdout);
+  assert.equal(synced.status, "synced");
+  assert.equal(synced.dryRun, false);
+  assert.equal(synced.plan.every(({ action }) => action === "create"), true);
+  assert.deepEqual(synced.plan, outOfSync.plan);
+
+  const finalCheck = runCli(root, "check", "--json");
+  assert.equal(finalCheck.status, 0, finalCheck.stderr);
+  const inSync = JSON.parse(finalCheck.stdout);
+  assert.equal(inSync.status, "in-sync");
+  assert.equal(inSync.plan.every(({ action }) => action === "unchanged"), true);
+
+  const unchangedSync = runCli(root, "sync", "--json");
+  assert.equal(unchangedSync.status, 0, unchangedSync.stderr);
+  assert.equal(JSON.parse(unchangedSync.stdout).status, "unchanged");
+
+  const secondInit = runCli(root, "init", "--json");
+  assert.equal(secondInit.status, 0, secondInit.stderr);
+  const unchangedInit = JSON.parse(secondInit.stdout);
+  assert.equal(unchangedInit.status, "unchanged");
+  assert.deepEqual(unchangedInit.createdPaths, []);
+  assert.deepEqual(unchangedInit.existingPaths, [".agents/guide.md", ".agents/config.yaml"]);
+});
+
+test("emits JSON blocked states and errors on their documented streams", (t) => {
+  const root = temporaryRepo(t);
+  write(root, "AGENTS.md", "# Existing unmanaged guidance\n");
+
+  const blocked = runCli(root, "sync", "--json");
+  assert.equal(blocked.status, 1);
+  assert.equal(blocked.stderr, "");
+  const blockedResult = JSON.parse(blocked.stdout);
+  assert.equal(blockedResult.ok, false);
+  assert.equal(blockedResult.status, "blocked");
+  assert.deepEqual(
+    blockedResult.plan.find(({ path }) => path === "AGENTS.md"),
+    {
+      action: "conflict",
+      path: "AGENTS.md",
+      reason: "unmanaged content differs; use --force to replace it",
+    },
+  );
+  assert.equal(lstatIfExists(join(root, "CLAUDE.md")), null);
+
+  const usage = runCli(root, "sync", "--adopt", "--force", "--json");
+  assert.equal(usage.status, 2);
+  assert.equal(usage.stdout, "");
+  assert.deepEqual(JSON.parse(usage.stderr), {
+    schemaVersion: 1,
+    command: "sync",
+    ok: false,
+    status: "error",
+    error: {
+      type: "usage",
+      message: "--adopt and --force are mutually exclusive.",
+    },
+  });
+
+  const missingRoot = temporaryDirectory(t);
+  const guidanceError = runCli(missingRoot, "check", "--json");
+  assert.equal(guidanceError.status, 1);
+  assert.equal(guidanceError.stdout, "");
+  const errorResult = JSON.parse(guidanceError.stderr);
+  assert.equal(errorResult.command, "check");
+  assert.equal(errorResult.error.type, "guidance");
+  assert.match(errorResult.error.message, /Could not find \.agents\/guide\.md/);
 });
 
 test("treats CRLF generated output as drift and rewrites deterministic LF", (t) => {
@@ -1259,13 +1433,37 @@ test("reports missing sources and invalid CLI combinations without writing", (t)
   assert.equal(duplicate.status, 2);
   assert.match(duplicate.stderr, /Duplicate option: --adopt/);
 
+  const unknownOption = runCli(root, "sync", "--unknown");
+  assert.equal(unknownOption.status, 2);
+  assert.match(unknownOption.stderr, /Unknown option: --unknown/);
+
+  const unknownCommand = runCli(root, "unknown", "--json");
+  assert.equal(unknownCommand.status, 2);
+  const unknownCommandError = JSON.parse(unknownCommand.stderr);
+  assert.equal(unknownCommandError.command, null);
+  assert.equal(unknownCommandError.error.message, "Unknown command: unknown");
+
   const invalidInit = runCli(root, "init", "--force");
   assert.equal(invalidInit.status, 2);
   assert.match(invalidInit.stderr, /init does not accept --adopt or --force/);
 
+  const invalidInitDryRun = runCli(root, "init", "--dry-run");
+  assert.equal(invalidInitDryRun.status, 2);
+  assert.match(invalidInitDryRun.stderr, /init does not accept --dry-run/);
+
+  const invalidCheckDryRun = runCli(root, "check", "--dry-run");
+  assert.equal(invalidCheckDryRun.status, 2);
+  assert.match(invalidCheckDryRun.stderr, /check does not accept --dry-run/);
+
+  const duplicateJson = runCli(root, "check", "--json", "--json");
+  assert.equal(duplicateJson.status, 2);
+  assert.equal(JSON.parse(duplicateJson.stderr).error.message, "Duplicate option: --json");
+
   const commandHelp = runCli(root, "sync", "--help");
   assert.equal(commandHelp.status, 0, commandHelp.stderr);
   assert.match(commandHelp.stdout, /missing, stale, obsolete, unmanaged, or unsafe/);
+  assert.match(commandHelp.stdout, /--dry-run/);
+  assert.match(commandHelp.stdout, /--json/);
 
   const initHelp = runCli(root, "init", "--help");
   assert.equal(initHelp.status, 0, initHelp.stderr);
@@ -1335,28 +1533,43 @@ test("packs, installs, and runs the published artifact", (t) => {
   assert.equal(version.status, 0, version.stderr);
   assert.equal(version.stdout, `${packageMetadata.version}\n`);
 
-  const init = spawnSync(process.execPath, [installedCli, "init"], {
+  const init = spawnSync(process.execPath, [installedCli, "init", "--json"], {
     cwd: consumerRoot,
     encoding: "utf8",
   });
   assert.equal(init.status, 0, init.stderr);
+  assert.equal(JSON.parse(init.stdout).status, "initialized");
   assert.equal(read(consumerRoot, ".agents/guide.md"), INITIAL_GUIDE);
   assert.equal(read(consumerRoot, ".agents/config.yaml"), INITIAL_CONFIG);
 
-  const sync = spawnSync(process.execPath, [installedCli, "sync"], {
+  const preview = spawnSync(
+    process.execPath,
+    [installedCli, "sync", "--dry-run", "--json"],
+    {
+      cwd: consumerRoot,
+      encoding: "utf8",
+    },
+  );
+  assert.equal(preview.status, 0, preview.stderr);
+  assert.equal(JSON.parse(preview.stdout).status, "changes-planned");
+  assert.equal(lstatIfExists(join(consumerRoot, "AGENTS.md")), null);
+
+  const sync = spawnSync(process.execPath, [installedCli, "sync", "--json"], {
     cwd: consumerRoot,
     encoding: "utf8",
   });
   assert.equal(sync.status, 0, sync.stderr);
+  assert.equal(JSON.parse(sync.stdout).status, "synced");
   for (const relativePath of generatedPaths) {
     assert.ok(lstatIfExists(join(consumerRoot, relativePath)));
   }
 
-  const check = spawnSync(process.execPath, [installedCli, "check"], {
+  const check = spawnSync(process.execPath, [installedCli, "check", "--json"], {
     cwd: consumerRoot,
     encoding: "utf8",
   });
   assert.equal(check.status, 0, check.stderr);
+  assert.equal(JSON.parse(check.stdout).status, "in-sync");
 });
 
 function lstatIfExists(path) {

@@ -9,7 +9,8 @@ guidance with AI and it is not an MCP server.
 ## Status
 
 The current milestone supports safe initialization, repository-wide guidance,
-always-activated rules, and path-activated Cursor and GitHub Copilot rules.
+always-activated rules, path-activated Cursor and GitHub Copilot rules,
+non-mutating sync previews, and machine-readable output.
 
 ## Usage
 
@@ -27,6 +28,52 @@ npx @martinmqz/agent-guidance-sync check
 there is no Git repository, it initializes the current directory. It creates
 missing `.agents/guide.md` and `.agents/config.yaml` files, never overwrites an
 existing source, and leaves output generation to an explicit `sync`.
+
+Preview the exact sync plan without staging, publishing, or deleting files:
+
+```sh
+npx @martinmqz/agent-guidance-sync sync --dry-run
+npx @martinmqz/agent-guidance-sync sync --force --dry-run
+```
+
+`--dry-run` is available only on `sync` and honors `--adopt` and `--force`.
+It exits `0` when the plan is safe to apply, including when changes are pending,
+and exits `1` when unmanaged or unsafe targets block the plan.
+
+## JSON output
+
+Pass `--json` to `init`, `sync`, or `check` to emit one JSON document. Normal
+operational results are written to stdout, including out-of-sync and blocked
+results that exit `1`. Usage and runtime errors are written to stderr. JSON
+mode preserves the command's normal exit codes:
+
+- `0`: the command succeeded; a dry run may still report pending changes.
+- `1`: guidance is out of sync, a sync is blocked, or guidance could not be
+  safely processed.
+- `2`: command-line usage is invalid.
+
+Every document has `schemaVersion: 1`, `command`, `ok`, and `status`. Command
+statuses are stable within that schema:
+
+| Command | Status values |
+| --- | --- |
+| `init` | `initialized`, `unchanged` |
+| `sync` | `synced`, `changes-planned`, `unchanged`, `blocked` |
+| `check` | `in-sync`, `out-of-sync` |
+| Error | `error` |
+
+`sync` and `check` include a deterministic `plan`. Each plan item exposes only
+`action`, repository-relative `path`, and an optional `reason`; generated
+contents and filesystem identity data are never serialized. Actions are
+`unchanged`, `create`, `update`, `adopt`, `replace`, `delete`, `conflict`, or
+`unsafe`. For example:
+
+```json
+{"schemaVersion":1,"command":"sync","ok":true,"status":"changes-planned","root":"/repo","dryRun":true,"takeover":"none","plan":[{"action":"create","path":"AGENTS.md"}]}
+```
+
+`init --json` still initializes the project. Use `sync --dry-run --json` for a
+machine-readable, non-mutating sync preview.
 
 ## Canonical format
 
