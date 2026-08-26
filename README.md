@@ -24,8 +24,9 @@ npx @martinmqz/agent-guidance-sync sync
 npx @martinmqz/agent-guidance-sync check
 ```
 
-`init` finds the nearest Git repository root from the current directory. When
-there is no Git repository, it initializes the current directory. It creates
+`init` reuses the nearest existing canonical source, otherwise finds the nearest
+Git repository root from the current directory. When there is no Git repository,
+it initializes the current directory. It creates
 missing `.agents/guide.md` and `.agents/config.yaml` files, never overwrites an
 existing source, and leaves output generation to an explicit `sync`.
 
@@ -120,6 +121,10 @@ paths:
 Prefer observable behavior over implementation details.
 ```
 
+Every rule body must begin with a level-one Markdown heading. Path-activated
+rules require at least one of the Cursor or GitHub Copilot adapters because
+those adapters own the scoped-rule formats.
+
 Descriptions and paths may be unquoted, single-quoted, or JSON-style
 double-quoted strings. Paths must use the indented list form shown above and
 must not be absolute, negated, comma-separated, contain backslashes, `..`
@@ -128,9 +133,11 @@ space. Windows reserved device-name segments are also rejected. Plain values
 using YAML comments, mappings, collections, anchors, aliases, tags, or block
 syntax must be quoted when a literal string is intended.
 
-Only regular files with lowercase kebab-case `.md` names are treated as rules.
+Only regular files with lowercase kebab-case `.md` names are treated as rules;
+other `.md` spellings are rejected so guidance cannot disappear silently.
 Auxiliary regular files such as `.DS_Store`, `.gitkeep`, `README.md`, and editor
-swap files are ignored; symlinks and non-regular entries remain unsafe. A
+swap files are ignored. Hidden auxiliary directories are ignored without being
+traversed; symlinks and non-regular entries remain unsafe. A
 leading UTF-8 byte-order mark is stripped from the guide, config, and rule files
 before parsing or generation.
 
@@ -169,12 +176,18 @@ exists.
 
 All created or updated output is staged and flushed before publication.
 Existing files use a same-directory atomic rename; missing files use an atomic
-hard-link publication. Obsolete files are identity-checked again immediately
-before removal. The multi-file commit is not transactional if the operating
-system fails during publication, and the tool does not claim protection from a
-hostile process that mutates an existing destination inside the final
-filesystem-syscall window. After any failed sync, rerun `check` before retrying.
-`check` uses the same plan as `sync` and never changes files.
+hard-link publication. The filesystem must support hard links for missing-file
+publication; the CLI does not fall back to a partially visible copy that would
+weaken its atomic no-clobber guarantee. Obsolete files are identity-checked
+again immediately before removal. The multi-file commit is not transactional
+if the operating system fails during publication, and the tool does not claim
+protection from a hostile process that mutates an existing destination inside
+the final filesystem-syscall window. After any failed sync, rerun `check` before
+retrying. `check` uses the same plan as `sync` and never changes files.
+
+Generated-file comparisons treat CRLF and LF checkouts as equivalent while new
+output is emitted with LF. This avoids fresh Windows checkouts reporting drift
+solely because Git applied `core.autocrlf`.
 
 ## Migrating older prototypes
 
@@ -195,7 +208,9 @@ npm test
 ```
 
 The implementation has no runtime dependencies and requires Node.js 20 or
-newer.
+newer. The synchronous library API uses process working-directory pinning to
+preserve no-follow filesystem guarantees and therefore must run on the main
+Node.js thread rather than inside a worker thread.
 
 ## License
 

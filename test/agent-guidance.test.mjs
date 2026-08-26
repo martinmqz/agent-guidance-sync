@@ -151,6 +151,21 @@ test("initializes the current directory when no Git repository is present", (t) 
   assert.equal(lstatIfExists(join(root, ".agents")), null);
 });
 
+test("init reuses the nearest existing canonical source before the Git root", (t) => {
+  const root = temporaryDirectory(t);
+  const nested = join(root, "packages", "app");
+  const descendant = join(nested, "src", "feature");
+  mkdirSync(join(root, ".git"));
+  mkdirSync(descendant, { recursive: true });
+  write(nested, ".agents/guide.md", "# Nested package guidance\n");
+
+  const init = runCli(descendant, "init");
+  assert.equal(init.status, 0, init.stderr);
+  assert.equal(read(nested, ".agents/guide.md"), "# Nested package guidance\n");
+  assert.equal(read(nested, ".agents/config.yaml"), INITIAL_CONFIG);
+  assert.equal(lstatIfExists(join(root, ".agents")), null);
+});
+
 test("init is idempotent and never overwrites an existing canonical source", (t) => {
   const root = temporaryDirectory(t);
   const existingGuide = "# Existing repository guidance\n";
@@ -597,6 +612,7 @@ test("ignores auxiliary regular files in the canonical rules tree", (t) => {
   write(root, ".agents/rules/.gitkeep", "");
   write(root, ".agents/rules/README.md", "# Rule authoring notes\n");
   write(root, ".agents/rules/frontend/react.md.swp", "editor state\n");
+  write(root, ".agents/rules/.obsidian/workspace.md", "editor state\n");
 
   const sync = runCli(root, "sync");
   assert.equal(sync.status, 0, sync.stderr);
@@ -604,6 +620,41 @@ test("ignores auxiliary regular files in the canonical rules tree", (t) => {
   for (const relativePath of listFiles(scopedExpectedRoot)) {
     assert.equal(read(root, relativePath), read(scopedExpectedRoot, relativePath));
   }
+});
+
+test("rejects rule-looking Markdown files whose names are not lowercase kebab-case", (t) => {
+  for (const name of ["API-Rules.md", "api-rules.MD", "README.MD"]) {
+    const root = temporaryRepo(t);
+    write(root, `.agents/rules/${name}`, "# Misnamed guidance\n");
+
+    const check = runCli(root, "check");
+    assert.equal(check.status, 1);
+    assert.match(check.stderr, /Canonical rule paths must use lowercase kebab-case/);
+    assert.equal(lstatIfExists(join(root, "AGENTS.md")), null);
+  }
+});
+
+test("requires a scoped adapter when canonical guidance contains path rules", (t) => {
+  const root = temporaryDirectory(t);
+  cpSync(join(scopedFixtureRoot, ".agents"), join(root, ".agents"), { recursive: true });
+  writeFileSync(
+    join(root, ".agents", "config.yaml"),
+    `version: 1
+adapters:
+  agents: true
+  claude: true
+  cursor: false
+  copilot: false
+`,
+  );
+
+  const check = runCli(root, "check");
+  assert.equal(check.status, 1);
+  assert.match(
+    check.stderr,
+    /Path-activated rules require the Cursor or GitHub Copilot adapter/,
+  );
+  assert.equal(lstatIfExists(join(root, "AGENTS.md")), null);
 });
 
 test("strips a leading UTF-8 BOM from every canonical input", (t) => {
@@ -950,12 +1001,52 @@ test("blocks all writes for unmanaged files inside reserved generated namespaces
   }
 });
 
+test("recovers exact owned temporary files left in reserved generated namespaces", (t) => {
+  const takeoverModes = [[], ["--adopt"], ["--force"]];
+  for (const takeover of takeoverModes) {
+    const root = temporaryDirectory(t);
+    cpSync(join(scopedFixtureRoot, ".agents"), join(root, ".agents"), { recursive: true });
+    assert.equal(runCli(root, "sync").status, 0);
+    const targetPath = ".cursor/rules/agent-guidance/frontend/react.mdc";
+    const temporaryPath =
+      ".cursor/rules/agent-guidance/frontend/.react.mdc.123.00000000-0000-4000-8000-000000000000.tmp";
+    write(root, temporaryPath, read(root, targetPath));
+
+    const check = runCli(root, "check");
+    assert.equal(check.status, 1);
+    assert.match(
+      check.stderr,
+      /obsolete: \.cursor\/rules\/agent-guidance\/frontend\/\.react\.mdc\.123\./,
+    );
+
+    const sync = runCli(root, "sync", ...takeover);
+    assert.equal(sync.status, 0, sync.stderr);
+    assert.equal(lstatIfExists(join(root, temporaryPath)), null);
+    assert.equal(runCli(root, "check").status, 0);
+  }
+});
+
+test("does not claim temp-shaped files without an exact ownership marker", (t) => {
+  const root = temporaryDirectory(t);
+  cpSync(join(scopedFixtureRoot, ".agents"), join(root, ".agents"), { recursive: true });
+  assert.equal(runCli(root, "sync").status, 0);
+  const temporaryPath =
+    ".cursor/rules/agent-guidance/frontend/.react.mdc.123.00000000-0000-4000-8000-000000000000.tmp";
+  write(root, temporaryPath, "# Unmanaged temporary-looking file\n");
+
+  const sync = runCli(root, "sync", "--force");
+  assert.equal(sync.status, 1);
+  assert.match(sync.stderr, /unmanaged: \.cursor\/rules\/agent-guidance\/frontend\/\.react\.mdc/);
+  assert.equal(read(root, temporaryPath), "# Unmanaged temporary-looking file\n");
+});
+
 test("disabled adapters remove only their exactly owned outputs", (t) => {
   const root = temporaryDirectory(t);
   cpSync(join(scopedFixtureRoot, ".agents"), join(root, ".agents"), { recursive: true });
   write(root, ".cursor/rules/personal.mdc", "# Personal Cursor guidance\n");
   write(root, ".github/instructions/personal.instructions.md", "# Personal Copilot guidance\n");
   assert.equal(runCli(root, "sync").status, 0);
+  rmSync(join(root, ".agents", "rules", "frontend", "react.md"));
 
   writeFileSync(
     join(root, ".agents", "config.yaml"),
@@ -1618,18 +1709,20 @@ test("emits JSON blocked states and errors on their documented streams", (t) => 
   assert.match(errorResult.error.message, /Could not find \.agents\/guide\.md/);
 });
 
-test("treats CRLF generated output as drift and rewrites deterministic LF", (t) => {
+test("treats CRLF generated output as equivalent checkout text", (t) => {
   const root = temporaryRepo(t);
   assert.equal(runCli(root, "sync").status, 0);
   const expected = read(root, "AGENTS.md");
-  writeFileSync(join(root, "AGENTS.md"), expected.replaceAll("\n", "\r\n"));
+  const crlf = expected.replaceAll("\n", "\r\n");
+  writeFileSync(join(root, "AGENTS.md"), crlf);
 
   const check = runCli(root, "check");
-  assert.equal(check.status, 1);
-  assert.match(check.stderr, /stale: AGENTS\.md/);
-  assert.equal(runCli(root, "sync").status, 0);
-  assert.equal(read(root, "AGENTS.md"), expected);
-  assert.doesNotMatch(read(root, "AGENTS.md"), /\r/);
+  assert.equal(check.status, 0, check.stderr);
+  assert.match(check.stdout, /Agent guidance is in sync/);
+  const sync = runCli(root, "sync");
+  assert.equal(sync.status, 0, sync.stderr);
+  assert.match(sync.stdout, /already in sync/);
+  assert.equal(read(root, "AGENTS.md"), crlf);
 });
 
 test("normalizes CRLF canonical input and emits one trailing newline", (t) => {
@@ -1643,6 +1736,146 @@ test("normalizes CRLF canonical input and emits one trailing newline", (t) => {
     assert.equal(read(root, relativePath), read(expectedRoot, relativePath));
   }
 });
+
+test("normalizes a large non-matching whitespace suffix in linear time", () => {
+  const guide = `# Performance fixture\n${"\n ".repeat(20_000)}x`;
+  const started = performance.now();
+  const targets = renderTargets(guide);
+  const elapsed = performance.now() - started;
+
+  assert.match(targets[0].contents, /\n x\n$/);
+  assert.ok(elapsed < 500, `Guide normalization took ${elapsed.toFixed(1)}ms`);
+});
+
+test("uses lossless bigint filesystem identities for every verified stat", (t) => {
+  const root = temporaryRepo(t);
+  const script = `
+import fs from "node:fs";
+import { syncBuiltinESMExports } from "node:module";
+
+const root = ${JSON.stringify(root)};
+const originalLstatSync = fs.lstatSync;
+const originalFstatSync = fs.fstatSync;
+let lstatCalls = 0;
+let fstatCalls = 0;
+fs.lstatSync = (path, options) => {
+  const caller = new Error().stack.split("\\n")[2] ?? "";
+  if (!caller.includes("node:fs")) {
+    if (options?.bigint !== true) throw new Error("lstatSync used a lossy identity");
+    lstatCalls += 1;
+  }
+  return originalLstatSync(path, options);
+};
+fs.fstatSync = (descriptor, options) => {
+  if (options?.bigint !== true) throw new Error("fstatSync used a lossy identity");
+  fstatCalls += 1;
+  return originalFstatSync(descriptor, options);
+};
+syncBuiltinESMExports();
+
+const { checkProject } = await import(${JSON.stringify(pathToFileURL(join(packageRoot, "src", "index.mjs")).href)});
+checkProject(root);
+if (lstatCalls === 0 || fstatCalls === 0) throw new Error("Filesystem identity probes did not run.");
+`;
+  const result = spawnSync(process.execPath, ["--input-type=module", "--eval", script], {
+    encoding: "utf8",
+  });
+
+  assert.equal(result.status, 0, result.stderr);
+  assert.equal(runCli(root, "sync").status, 0);
+  assert.equal(runCli(root, "check").status, 0);
+});
+
+test("fails closed when the filesystem reports an unusable zero inode", (t) => {
+  const root = temporaryRepo(t);
+  const originalFiles = snapshotFiles(root);
+  const script = `
+import fs from "node:fs";
+import { syncBuiltinESMExports } from "node:module";
+
+const root = ${JSON.stringify(root)};
+const originalLstatSync = fs.lstatSync;
+fs.lstatSync = (path, options) => {
+  const stats = originalLstatSync(path, options);
+  if (path === root) stats.ino = 0n;
+  return stats;
+};
+syncBuiltinESMExports();
+
+const { syncProject } = await import(${JSON.stringify(pathToFileURL(join(packageRoot, "src", "index.mjs")).href)});
+let failure = null;
+try {
+  syncProject(root);
+} catch (error) {
+  failure = error;
+}
+if (!failure) throw new Error("Synchronization accepted an unusable zero inode.");
+`;
+  const result = spawnSync(process.execPath, ["--input-type=module", "--eval", script], {
+    encoding: "utf8",
+  });
+
+  assert.equal(result.status, 0, result.stderr);
+  assert.deepEqual(snapshotFiles(root), originalFiles);
+});
+
+test("reports the synchronous API main-thread requirement from workers", (t) => {
+  const root = temporaryRepo(t);
+  const moduleUrl = pathToFileURL(join(packageRoot, "src", "index.mjs")).href;
+  const workerScript = `
+import { parentPort } from "node:worker_threads";
+import(${JSON.stringify(moduleUrl)}).then(({ checkProject }) => {
+  try {
+    checkProject(${JSON.stringify(root)});
+    parentPort.postMessage({ ok: true });
+  } catch (error) {
+    parentPort.postMessage({ message: error.message, name: error.name, ok: false });
+  }
+});
+`;
+  const controllerScript = `
+import { Worker } from "node:worker_threads";
+const worker = new Worker(${JSON.stringify(workerScript)}, { eval: true });
+const result = await new Promise((resolveResult, rejectResult) => {
+  worker.once("message", resolveResult);
+  worker.once("error", rejectResult);
+});
+if (result.ok || result.name !== "GuidanceError" || !/main Node.js thread/.test(result.message)) {
+  throw new Error(JSON.stringify(result));
+}
+`;
+  const result = spawnSync(
+    process.execPath,
+    ["--input-type=module", "--eval", controllerScript],
+    { encoding: "utf8" },
+  );
+
+  assert.equal(result.status, 0, result.stderr);
+});
+
+test(
+  "rejects a FIFO canonical source without waiting for a writer",
+  { skip: process.platform === "win32" },
+  (t) => {
+    const root = temporaryRepo(t);
+    const guidePath = join(root, ".agents", "guide.md");
+    rmSync(guidePath);
+    const created = spawnSync("mkfifo", [guidePath], { encoding: "utf8" });
+    if (created.status !== 0) {
+      t.skip(`mkfifo is unavailable: ${created.stderr}`);
+      return;
+    }
+
+    const check = spawnSync(process.execPath, [cliPath, "check"], {
+      cwd: root,
+      encoding: "utf8",
+      timeout: 2_000,
+    });
+    assert.notEqual(check.error?.code, "ETIMEDOUT");
+    assert.equal(check.status, 1);
+    assert.match(check.stderr, /Canonical source is not a regular file/);
+  },
+);
 
 test("preserves meaningful leading indentation and trailing Markdown spaces", (t) => {
   const root = temporaryRepo(t);
@@ -2259,6 +2492,78 @@ if (!failureMessages.some((message) => /parent directory changed while staging/.
 );
 
 test(
+  "pins a generated parent identity before an ancestor is replaced with a real directory",
+  { skip: process.platform === "win32" },
+  (t) => {
+    const root = temporaryRepo(t);
+    const cursorPath = join(root, ".cursor");
+    const movedCursorPath = join(root, ".cursor-original");
+    const replacementCursorPath = join(root, ".cursor-replacement");
+    mkdirSync(join(cursorPath, "rules"), { recursive: true });
+    mkdirSync(join(replacementCursorPath, "rules"), { recursive: true });
+    write(replacementCursorPath, "rules/sentinel", "outside\n");
+    const realCursorPath = realpathSync(cursorPath);
+    const replacementBefore = snapshotFiles(replacementCursorPath);
+
+    const script = `
+import fs from "node:fs";
+import { syncBuiltinESMExports } from "node:module";
+
+const root = ${JSON.stringify(root)};
+const cursorPath = ${JSON.stringify(cursorPath)};
+const realCursorPath = ${JSON.stringify(realCursorPath)};
+const movedCursorPath = ${JSON.stringify(movedCursorPath)};
+const replacementCursorPath = ${JSON.stringify(replacementCursorPath)};
+const originalChdir = process.chdir;
+let swapped = false;
+process.chdir = (path) => {
+  const current = process.cwd();
+  const stack = new Error().stack ?? "";
+  const result = originalChdir(path);
+  if (
+    !swapped &&
+    current === realCursorPath &&
+    stack.includes("ensureTargetParentDirectories")
+  ) {
+    fs.renameSync(cursorPath, movedCursorPath);
+    fs.renameSync(replacementCursorPath, cursorPath);
+    swapped = true;
+  }
+  return result;
+};
+syncBuiltinESMExports();
+
+const { syncProject } = await import(${JSON.stringify(pathToFileURL(join(packageRoot, "src", "index.mjs")).href)});
+let failure = null;
+try {
+  syncProject(root);
+} catch (error) {
+  failure = error;
+}
+if (!swapped) {
+  if (failure) throw failure;
+  throw new Error("The generated ancestor substitution was not injected.");
+}
+if (!failure) throw new Error("Synchronization accepted a replacement generated ancestor.");
+const failureMessages = [];
+for (let current = failure; current; current = current.cause) failureMessages.push(current.message);
+if (!failureMessages.some((message) => /parent directory changed while staging/.test(message))) {
+  throw failure;
+}
+`;
+    const result = spawnSync(process.execPath, ["--input-type=module", "--eval", script], {
+      encoding: "utf8",
+    });
+
+    assert.equal(result.status, 0, result.stderr);
+    assert.deepEqual(snapshotFiles(cursorPath), replacementBefore);
+    assert.deepEqual(snapshotFiles(movedCursorPath), {});
+    assert.equal(listFiles(root).some((path) => path.endsWith(".tmp")), false);
+    assert.equal(lstatIfExists(join(root, "AGENTS.md")), null);
+  },
+);
+
+test(
   "publishes generated files through their verified parent directory",
   { skip: process.platform === "win32" },
   (t) => {
@@ -2845,6 +3150,96 @@ if (!swapped) throw new Error("The deletion substitution was not injected.");
     assert.doesNotMatch(result.stdout, /external-output-deleted/);
     assert.equal(readFileSync(join(outside, "react.mdc"), "utf8"), "outside\n");
     assert.deepEqual(listFiles(movedTargetParent), []);
+    assert.equal(listFiles(root).some((path) => path.endsWith(".tmp")), false);
+  },
+);
+
+test(
+  "pins the deletion ancestor chain before a real-directory substitution",
+  { skip: process.platform === "win32" },
+  (t) => {
+    const root = temporaryDirectory(t);
+    cpSync(join(scopedFixtureRoot, ".agents"), join(root, ".agents"), { recursive: true });
+    assert.equal(runCli(root, "sync").status, 0);
+    rmSync(join(root, ".agents", "rules", "frontend", "react.md"));
+
+    const cursorPath = join(root, ".cursor");
+    const movedCursorPath = join(root, ".cursor-original");
+    const replacementCursorPath = join(root, ".cursor-replacement");
+    const targetRelativePath = join("rules", "agent-guidance", "frontend", "react.mdc");
+    const targetPath = join(cursorPath, targetRelativePath);
+    const targetParent = dirname(targetPath);
+    const inspectedParent = dirname(targetParent);
+    const realInspectedParent = realpathSync(inspectedParent);
+    const replacementTargetPath = join(replacementCursorPath, targetRelativePath);
+    mkdirSync(dirname(replacementTargetPath), { recursive: true });
+    const linked = spawnSync("ln", [targetPath, replacementTargetPath], { encoding: "utf8" });
+    if (linked.status !== 0) {
+      t.skip(`hard links are unavailable: ${linked.stderr}`);
+      return;
+    }
+
+    const script = `
+import fs from "node:fs";
+import { syncBuiltinESMExports } from "node:module";
+
+const root = ${JSON.stringify(root)};
+const cursorPath = ${JSON.stringify(cursorPath)};
+const movedCursorPath = ${JSON.stringify(movedCursorPath)};
+const replacementCursorPath = ${JSON.stringify(replacementCursorPath)};
+const targetParent = ${JSON.stringify(targetParent)};
+const realInspectedParent = ${JSON.stringify(realInspectedParent)};
+const originalChdir = process.chdir;
+const originalLstatSync = fs.lstatSync;
+let swapped = false;
+const swap = () => {
+  if (swapped) return;
+  fs.renameSync(cursorPath, movedCursorPath);
+  fs.renameSync(replacementCursorPath, cursorPath);
+  swapped = true;
+};
+fs.lstatSync = (path, options) => {
+  const stack = new Error().stack ?? "";
+  if (!swapped && path === targetParent && stack.includes("commitDeletion")) swap();
+  return originalLstatSync(path, options);
+};
+process.chdir = (path) => {
+  const current = process.cwd();
+  const stack = new Error().stack ?? "";
+  const result = originalChdir(path);
+  if (
+    !swapped &&
+    current === realInspectedParent &&
+    stack.includes("commitDeletion")
+  ) {
+    swap();
+  }
+  return result;
+};
+syncBuiltinESMExports();
+
+const { syncProject } = await import(${JSON.stringify(pathToFileURL(join(packageRoot, "src", "index.mjs")).href)});
+let failure = null;
+try {
+  syncProject(root);
+} catch (error) {
+  failure = error;
+}
+if (!swapped) throw new Error("The deletion ancestor substitution was not injected.");
+if (!failure) throw new Error("Synchronization accepted a replacement deletion ancestor.");
+const failureMessages = [];
+for (let current = failure; current; current = current.cause) failureMessages.push(current.message);
+if (!failureMessages.some((message) => /parent directory changed before deletion/.test(message))) {
+  throw failure;
+}
+`;
+    const result = spawnSync(process.execPath, ["--input-type=module", "--eval", script], {
+      encoding: "utf8",
+    });
+
+    assert.equal(result.status, 0, result.stderr);
+    assert.ok(lstatIfExists(join(cursorPath, targetRelativePath)));
+    assert.ok(lstatIfExists(join(movedCursorPath, targetRelativePath)));
     assert.equal(listFiles(root).some((path) => path.endsWith(".tmp")), false);
   },
 );
