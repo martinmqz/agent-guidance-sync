@@ -16,7 +16,7 @@ import {
 } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join, relative, resolve } from "node:path";
-import { fileURLToPath } from "node:url";
+import { fileURLToPath, pathToFileURL } from "node:url";
 import test from "node:test";
 import { setTimeout as delay } from "node:timers/promises";
 import { INITIAL_CONFIG, INITIAL_GUIDE, initProject, renderTargets } from "../src/index.mjs";
@@ -271,6 +271,67 @@ test("init rejects symlinked canonical source paths without following them", (t)
   assert.equal(configResult.status, 1);
   assert.match(configResult.stderr, /Canonical source must not be a symlink/);
   assert.equal(lstatIfExists(join(configRoot, ".agents", "guide.md")), null);
+});
+
+test("init never stages temporary files through a replaced source directory", (t) => {
+  const root = temporaryDirectory(t);
+  const agentsPath = join(root, ".agents");
+  const movedAgentsPath = join(root, ".agents-original");
+  const outside = temporaryDirectory(t, "agent-guidance-init-race-outside-");
+  mkdirSync(agentsPath);
+  const probePath = join(root, ".agent-guidance-init-race-probe");
+  if (!createSymlinkOrSkip(t, outside, probePath, "dir")) return;
+  rmSync(probePath);
+
+  const script = `
+import fs from "node:fs";
+import { syncBuiltinESMExports } from "node:module";
+import { dirname } from "node:path";
+
+const root = ${JSON.stringify(root)};
+const agentsPath = ${JSON.stringify(agentsPath)};
+const movedAgentsPath = ${JSON.stringify(movedAgentsPath)};
+const outside = ${JSON.stringify(outside)};
+const originalOpenSync = fs.openSync;
+let swapped = false;
+fs.openSync = (path, flags, mode) => {
+  if (!swapped && typeof path === "string" && path.endsWith(".tmp")) {
+    fs.renameSync(agentsPath, movedAgentsPath);
+    fs.symlinkSync(outside, agentsPath, process.platform === "win32" ? "junction" : "dir");
+    swapped = true;
+  }
+  const descriptor = originalOpenSync(path, flags, mode);
+  if (
+    swapped &&
+    typeof path === "string" &&
+    fs.realpathSync(${JSON.stringify(outside)}) === fs.realpathSync(dirname(path))
+  ) {
+    process.stdout.write("external-temp-opened\\n");
+  }
+  return descriptor;
+};
+syncBuiltinESMExports();
+
+const { initProject } = await import(${JSON.stringify(pathToFileURL(join(packageRoot, "src", "index.mjs")).href)});
+let failure = null;
+try {
+  initProject(root);
+} catch (error) {
+  failure = error;
+}
+if (!swapped) throw new Error("The source-directory substitution was not injected.");
+if (!failure || !/changed during initialization/.test(failure.message)) throw failure;
+`;
+  const result = spawnSync(process.execPath, ["--input-type=module", "--eval", script], {
+    encoding: "utf8",
+  });
+
+  assert.equal(result.status, 0, result.stderr);
+  assert.doesNotMatch(result.stdout, /external-temp-opened/);
+  assert.deepEqual(listFiles(outside), []);
+  assert.equal(listFiles(root).some((path) => path.endsWith(".tmp")), false);
+  assert.equal(lstatSync(agentsPath).isSymbolicLink(), true);
+  assert.ok(lstatSync(movedAgentsPath).isDirectory());
 });
 
 test("init rejects non-directory and non-regular canonical source paths", (t) => {
@@ -1385,7 +1446,7 @@ test(
 
 test(
   "does not publish earlier targets when a later write cannot be staged",
-  { skip: process.platform === "win32" },
+  { skip: process.platform === "win32" || process.getuid?.() === 0 },
   (t) => {
     const root = temporaryRepo(t);
     const unwritableDirectory = join(root, ".github");

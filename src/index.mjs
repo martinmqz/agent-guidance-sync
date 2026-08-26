@@ -635,8 +635,8 @@ export function initProject(root) {
 
       const path = absoluteTargetPath(projectRoot, source.relativePath);
       const temporaryPath = join(
-        agentsPath,
-        `.${basename(path)}.${process.pid}.${randomUUID()}.tmp`,
+        projectRoot,
+        `.agent-guidance-init.${basename(path)}.${process.pid}.${randomUUID()}.tmp`,
       );
       let descriptor = null;
       let temporaryIdentity = null;
