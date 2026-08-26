@@ -3733,7 +3733,7 @@ test("reports the package metadata version", () => {
   assert.equal(version.stdout, `${packageMetadata.version}\n`);
 });
 
-test("packs, installs, and runs the published artifact", (t) => {
+test("packs the exact public surface, installs, and runs the artifact", (t) => {
   const artifactRoot = temporaryDirectory(t, "agent-guidance-artifact-");
   const consumerRoot = temporaryDirectory(t, "agent-guidance-consumer-");
   const npmCache = join(artifactRoot, "npm-cache");
@@ -3751,7 +3751,31 @@ test("packs, installs, and runs the published artifact", (t) => {
     },
   );
   assert.equal(pack.status, 0, pack.stderr);
-  const [{ filename }] = JSON.parse(pack.stdout);
+  const [packageReport] = JSON.parse(pack.stdout);
+  const expectedPackagePaths = [
+    "LICENSE",
+    "README.md",
+    "bin/agent-guidance.mjs",
+    "package.json",
+    "src/cli.mjs",
+    "src/index.mjs",
+  ];
+  assert.equal(packageReport.name, packageMetadata.name);
+  assert.equal(packageReport.version, packageMetadata.version);
+  assert.equal(packageReport.entryCount, expectedPackagePaths.length);
+  assert.deepEqual(packageReport.bundled, []);
+  assert.deepEqual(
+    packageReport.files.map(({ path }) => path).sort(),
+    expectedPackagePaths,
+  );
+  const packagedBin = packageReport.files.find(
+    ({ path }) => path === "bin/agent-guidance.mjs",
+  );
+  if (process.platform !== "win32") {
+    assert.notEqual(packagedBin.mode & 0o111, 0, "packed CLI must remain executable");
+  }
+
+  const { filename } = packageReport;
   const tarballPath = join(artifactRoot, filename);
   writeFileSync(join(consumerRoot, "package.json"), '{"private":true}\n');
 
