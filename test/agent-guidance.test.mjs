@@ -1809,6 +1809,159 @@ test(
 );
 
 test(
+  "classifies generated targets through verified parent directories",
+  { skip: process.platform === "win32" },
+  (t) => {
+    const root = temporaryRepo(t);
+    assert.equal(runCli(root, "sync").status, 0);
+    const parent = join(root, ".github");
+    const movedParent = join(root, ".github-original");
+    const outsideContainer = temporaryDirectory(t, "agent-guidance-classify-parent-outside-");
+    const outsideParent = join(outsideContainer, "github");
+    cpSync(parent, outsideParent, { recursive: true });
+    const targetPath = join(parent, "copilot-instructions.md");
+    const originalFiles = snapshotFiles(parent);
+    const outsideFiles = snapshotFiles(outsideParent);
+
+    const script = `
+import fs from "node:fs";
+import { syncBuiltinESMExports } from "node:module";
+
+const root = ${JSON.stringify(root)};
+const parent = ${JSON.stringify(parent)};
+const movedParent = ${JSON.stringify(movedParent)};
+const outsideParent = ${JSON.stringify(outsideParent)};
+const targetPath = ${JSON.stringify(targetPath)};
+const originalLstatSync = fs.lstatSync;
+const originalOpenSync = fs.openSync;
+let externalAccess = false;
+let swapped = false;
+fs.lstatSync = (path, options) => {
+  const stats = originalLstatSync(path, options);
+  if (!swapped && path === parent) {
+    fs.renameSync(parent, movedParent);
+    fs.symlinkSync(outsideParent, parent, "dir");
+    swapped = true;
+  }
+  return stats;
+};
+fs.openSync = (path, flags, mode) => {
+  if (swapped && path === targetPath) externalAccess = true;
+  return originalOpenSync(path, flags, mode);
+};
+syncBuiltinESMExports();
+
+const { planProject } = await import(${JSON.stringify(pathToFileURL(join(packageRoot, "src", "index.mjs")).href)});
+let failure = null;
+try {
+  planProject(root);
+} catch (error) {
+  failure = error;
+}
+if (!swapped) throw new Error("The generated-target parent substitution was not injected.");
+if (externalAccess) throw new Error("Planning read a target through the replacement parent.");
+if (!failure) throw new Error("Planning accepted a replacement generated-target parent.");
+const failureMessages = [];
+for (let current = failure; current; current = current.cause) failureMessages.push(current.message);
+if (!failureMessages.some((message) => /parent changed while guidance was being planned/.test(message))) {
+  throw failure;
+}
+`;
+    const result = spawnSync(process.execPath, ["--input-type=module", "--eval", script], {
+      encoding: "utf8",
+    });
+
+    assert.equal(result.status, 0, result.stderr);
+    assert.deepEqual(snapshotFiles(movedParent), originalFiles);
+    assert.deepEqual(snapshotFiles(outsideParent), outsideFiles);
+    assert.equal(lstatSync(parent).isSymbolicLink(), true);
+  },
+);
+
+test(
+  "rejects same-inode symlink replacements before update publication",
+  { skip: process.platform === "win32" },
+  (t) => {
+    const root = temporaryRepo(t);
+    writeFileSync(
+      join(root, ".agents", "config.yaml"),
+      `version: 1
+adapters:
+  agents: false
+  claude: false
+  cursor: false
+  copilot: true
+`,
+    );
+    assert.equal(runCli(root, "sync").status, 0);
+    const parent = join(root, ".github");
+    const targetPath = join(parent, "copilot-instructions.md");
+    const originalTarget = readFileSync(targetPath, "utf8");
+    writeFileSync(join(root, ".agents", "guide.md"), "# Updated guidance\n");
+    const outside = temporaryDirectory(t, "agent-guidance-publication-parent-outside-");
+    const movedParent = join(outside, "github");
+
+    const script = `
+import fs from "node:fs";
+import { syncBuiltinESMExports } from "node:module";
+import { basename } from "node:path";
+
+const root = ${JSON.stringify(root)};
+const parent = ${JSON.stringify(parent)};
+const movedParent = ${JSON.stringify(movedParent)};
+const originalChdir = process.chdir;
+const originalOpenSync = fs.openSync;
+let staged = false;
+let swapped = false;
+fs.openSync = (path, flags, mode) => {
+  const descriptor = originalOpenSync(path, flags, mode);
+  if (
+    typeof path === "string" &&
+    basename(path).startsWith(".copilot-instructions.md.") &&
+    path.endsWith(".tmp")
+  ) {
+    staged = true;
+  }
+  return descriptor;
+};
+process.chdir = (path) => {
+  if (!swapped && staged && path === parent) {
+    fs.renameSync(parent, movedParent);
+    fs.symlinkSync(movedParent, parent, "dir");
+    swapped = true;
+  }
+  return originalChdir(path);
+};
+syncBuiltinESMExports();
+
+const { syncProject } = await import(${JSON.stringify(pathToFileURL(join(packageRoot, "src", "index.mjs")).href)});
+let failure = null;
+try {
+  syncProject(root);
+} catch (error) {
+  failure = error;
+}
+if (!staged) throw new Error("The generated update was not staged.");
+if (!swapped) throw new Error("The same-inode parent substitution was not injected.");
+if (!failure) throw new Error("Synchronization published through a same-inode symlink.");
+const failureMessages = [];
+for (let current = failure; current; current = current.cause) failureMessages.push(current.message);
+if (!failureMessages.some((message) => /parent directory changed before publication/.test(message))) {
+  throw failure;
+}
+`;
+    const result = spawnSync(process.execPath, ["--input-type=module", "--eval", script], {
+      encoding: "utf8",
+    });
+
+    assert.equal(result.status, 0, result.stderr);
+    assert.equal(readFileSync(join(movedParent, "copilot-instructions.md"), "utf8"), originalTarget);
+    assert.equal(lstatSync(parent).isSymbolicLink(), true);
+    assert.equal(listFiles(movedParent).some((path) => path.endsWith(".tmp")), false);
+  },
+);
+
+test(
   "aborts planning when the verified project root is replaced",
   { skip: process.platform === "win32" },
   (t) => {
