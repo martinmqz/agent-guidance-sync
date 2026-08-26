@@ -185,6 +185,12 @@ protection from a hostile process that mutates an existing destination inside
 the final filesystem-syscall window. After any failed sync, rerun `check` before
 retrying. `check` uses the same plan as `sync` and never changes files.
 
+Final validation is sequential and does not create an atomic snapshot across
+the separate canonical and generated paths. A non-cooperating process can
+modify an earlier path after its last validation read but before another path
+is checked or `sync` returns. Environments that permit concurrent writers must
+serialize them externally and run `check` after `sync`.
+
 Generated-file comparisons treat CRLF and LF checkouts as equivalent while new
 output is emitted with LF. This avoids fresh Windows checkouts reporting drift
 solely because Git applied `core.autocrlf`.
