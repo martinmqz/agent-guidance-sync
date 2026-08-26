@@ -12,6 +12,7 @@ import {
   readdirSync,
   readFileSync,
   renameSync,
+  rmdirSync,
   rmSync,
   writeFileSync,
 } from "node:fs";
@@ -59,10 +60,16 @@ const TARGET_PATHS = Object.freeze({
   cursor: ".cursor/rules/agent-guidance.mdc",
   copilot: ".github/copilot-instructions.md",
 });
-const MANAGED_RULE_NAMESPACES = Object.freeze([
-  ".cursor/rules/agent-guidance",
-  ".github/instructions/agent-guidance",
-]);
+const SCOPED_ADAPTERS = Object.freeze({
+  cursor: Object.freeze({
+    namespace: ".cursor/rules/agent-guidance",
+    targetPath: TARGET_PATHS.cursor,
+  }),
+  copilot: Object.freeze({
+    namespace: ".github/instructions/agent-guidance",
+    targetPath: TARGET_PATHS.copilot,
+  }),
+});
 
 export class GuidanceError extends Error {
   constructor(message, options) {
@@ -121,7 +128,7 @@ function readStableRegularFile(path, expectedStats, label) {
 }
 
 function normalizeLineEndings(contents) {
-  return contents.replace(/\r\n?/gu, "\n");
+  return contents.replace(/^\uFEFF/u, "").replace(/\r\n?/gu, "\n");
 }
 
 function normalizeGuide(contents) {
@@ -402,8 +409,6 @@ function renderedTarget(relativePath, unmanagedContents, prefix = "", sourcePath
   const marker = generatedMarker(relativePath, sourcePath);
   return {
     relativePath,
-    marker,
-    ownershipHeader: `${prefix}${marker}`,
     contents: `${prefix}${marker}\n\n${unmanagedContents}`,
     unmanagedContents: `${prefix}${unmanagedContents}`,
   };
@@ -462,7 +467,7 @@ export function renderTargets(
   if (adapters.cursor) {
     targets.push(renderedTarget(TARGET_PATHS.cursor, guide, cursorPrefix));
     for (const rule of pathRules) {
-      const relativePath = `.cursor/rules/agent-guidance/${scopedTargetStem(rule)}.mdc`;
+      const relativePath = `${SCOPED_ADAPTERS.cursor.namespace}/${scopedTargetStem(rule)}.mdc`;
       targets.push(
         renderedTarget(
           relativePath,
@@ -476,7 +481,7 @@ export function renderTargets(
   if (adapters.copilot) {
     targets.push(renderedTarget(TARGET_PATHS.copilot, guide));
     for (const rule of pathRules) {
-      const relativePath = `.github/instructions/agent-guidance/${scopedTargetStem(rule)}.instructions.md`;
+      const relativePath = `${SCOPED_ADAPTERS.copilot.namespace}/${scopedTargetStem(rule)}.instructions.md`;
       targets.push(
         renderedTarget(
           relativePath,
@@ -757,11 +762,105 @@ function parentPathIssue(root, targetPath) {
   return null;
 }
 
+function removeCreatedDirectories(createdDirectories) {
+  for (const created of [...createdDirectories].reverse()) {
+    try {
+      const current = lstatIfExists(created.path);
+      if (
+        !current?.isDirectory() ||
+        current.isSymbolicLink() ||
+        !hasSameFileIdentity(current, created.identity) ||
+        readdirSync(created.path).length > 0
+      ) {
+        continue;
+      }
+      rmdirSync(created.path);
+    } catch {
+      // Directory cleanup is best-effort and never removes a changed or non-empty path.
+    }
+  }
+}
+
+function ensureTargetParentDirectories(root, targetPath) {
+  const createdDirectories = [];
+  const segments = dirname(targetPath).split("/").filter((segment) => segment !== ".");
+  let current = root;
+  let currentStats = lstatIfExists(current);
+  if (!currentStats?.isDirectory() || currentStats.isSymbolicLink()) {
+    throw new GuidanceError(`Project root changed while creating generated directories: ${root}`);
+  }
+
+  try {
+    for (const segment of segments) {
+      const stableCurrent = lstatIfExists(current);
+      if (
+        !stableCurrent?.isDirectory() ||
+        stableCurrent.isSymbolicLink() ||
+        !hasSameFileIdentity(stableCurrent, currentStats)
+      ) {
+        throw new GuidanceError(
+          `Generated directory changed while parents were being created: ${relative(root, current).split(sep).join("/") || "."}`,
+        );
+      }
+
+      const next = join(current, segment);
+      let nextStats = lstatIfExists(next);
+      let created = false;
+      if (!nextStats) {
+        try {
+          mkdirSync(next);
+          created = true;
+        } catch (error) {
+          if (!error || typeof error !== "object" || error.code !== "EEXIST") {
+            throw new GuidanceError(
+              `Could not create generated directory: ${relative(root, next).split(sep).join("/")}`,
+              { cause: error },
+            );
+          }
+        }
+        const currentAfterCreate = lstatIfExists(current);
+        if (
+          !currentAfterCreate?.isDirectory() ||
+          currentAfterCreate.isSymbolicLink() ||
+          !hasSameFileIdentity(currentAfterCreate, currentStats)
+        ) {
+          throw new GuidanceError(
+            `Generated directory changed while parents were being created: ${relative(root, current).split(sep).join("/") || "."}`,
+          );
+        }
+        nextStats = lstatIfExists(next);
+      }
+      if (nextStats?.isSymbolicLink()) {
+        throw new GuidanceError(
+          `generated path traverses a symlink: ${relative(root, next).split(sep).join("/")}`,
+        );
+      }
+      if (!nextStats?.isDirectory()) {
+        throw new GuidanceError(
+          `generated path traverses a non-directory: ${relative(root, next).split(sep).join("/")}`,
+        );
+      }
+      if (created) {
+        createdDirectories.push({
+          identity: { dev: nextStats.dev, ino: nextStats.ino },
+          path: next,
+        });
+      }
+      current = next;
+      currentStats = nextStats;
+    }
+    return createdDirectories;
+  } catch (error) {
+    removeCreatedDirectories(createdDirectories);
+    throw error;
+  }
+}
+
 function hasOwnedMarkerForPath(contents, relativePath) {
   const normalized = normalizeLineEndings(contents);
   let header = normalized;
-  const cursorPrefix = `${MANAGED_RULE_NAMESPACES[0]}/`;
-  const copilotPrefix = `${MANAGED_RULE_NAMESPACES[1]}/`;
+  const cursorPrefix = `${SCOPED_ADAPTERS.cursor.namespace}/`;
+  const copilotPrefix = `${SCOPED_ADAPTERS.copilot.namespace}/`;
   if (relativePath === TARGET_PATHS.cursor) {
     const preamble = cursorPreamble();
     if (!header.startsWith(preamble)) return false;
@@ -840,17 +939,7 @@ function classifyDisabledOwnedTargets(root, expectedPaths) {
   for (const relativePath of Object.values(TARGET_PATHS)) {
     if (expectedPaths.has(relativePath)) continue;
     const issue = parentPathIssue(root, relativePath);
-    if (issue) {
-      obsolete.push({
-        action: "unsafe",
-        contents: null,
-        originalContents: null,
-        originalIdentity: null,
-        reason: issue,
-        relativePath,
-      });
-      continue;
-    }
+    if (issue) continue;
     const path = absoluteTargetPath(root, relativePath);
     const stats = lstatIfExists(path);
     if (!stats?.isFile() || stats.isSymbolicLink()) continue;
@@ -912,7 +1001,8 @@ function classifyManagedRuleNamespaces(root, expectedPaths) {
           contents: null,
           originalContents: contents,
           originalIdentity: { dev: stats.dev, ino: stats.ino },
-          reason: "unmanaged file is inside a reserved generated namespace",
+          reason:
+            "unmanaged file is inside a reserved generated namespace; move or remove it explicitly",
           relativePath,
         });
       }
@@ -927,9 +1017,11 @@ function classifyManagedRuleNamespaces(root, expectedPaths) {
     }
   };
 
-  for (const relativeNamespace of MANAGED_RULE_NAMESPACES) {
+  for (const { namespace: relativeNamespace, targetPath } of Object.values(SCOPED_ADAPTERS)) {
+    const adapterEnabled = expectedPaths.has(targetPath);
     const issue = parentPathIssue(root, `${relativeNamespace}/.ownership-probe`);
     if (issue) {
+      if (!adapterEnabled) continue;
       items.push({
         action: "unsafe",
         contents: null,
@@ -1082,6 +1174,7 @@ function readCanonicalRules(agentsPath) {
       if (!stats.isFile()) {
         throw new GuidanceError(`Canonical rule is not a regular file: ${path}`);
       }
+      if (!/^[a-z0-9]+(?:-[a-z0-9]+)*\.md$/u.test(name)) continue;
       validateRuleRelativePath(relativePath);
       ruleFiles.push({
         contents: readStableRegularFile(path, stats, `canonical rule ${relativePath}`),
@@ -1234,9 +1327,12 @@ function stageAtomicWrite(root, item) {
   assertTargetUnchanged(root, item);
   const path = absoluteTargetPath(root, item.relativePath);
   const parent = dirname(path);
-  mkdirSync(parent, { recursive: true });
+  const createdDirectories = ensureTargetParentDirectories(root, item.relativePath);
   const issue = parentPathIssue(root, item.relativePath);
-  if (issue) throw new GuidanceError(`${item.relativePath}: ${issue}`);
+  if (issue) {
+    removeCreatedDirectories(createdDirectories);
+    throw new GuidanceError(`${item.relativePath}: ${issue}`);
+  }
 
   const currentStats = lstatIfExists(path);
   const preservedMode = currentStats?.isFile() && !currentStats.isSymbolicLink()
@@ -1260,6 +1356,7 @@ function stageAtomicWrite(root, item) {
     assertTargetUnchanged(root, item);
     const staged = {
       committed: false,
+      createdDirectories,
       item,
       path,
       temporaryIdentity,
@@ -1292,6 +1389,7 @@ function stageAtomicWrite(root, item) {
         // Preserve the original failure; cleanup remains best-effort.
       }
     }
+    removeCreatedDirectories(createdDirectories);
     throw new GuidanceError(`Could not stage atomic write for ${item.relativePath}.`, {
       cause: error,
     });
@@ -1325,6 +1423,29 @@ function commitDeletion(root, item) {
   try {
     rmSync(path);
     item.committed = true;
+    const managedNamespace = Object.values(SCOPED_ADAPTERS)
+      .map(({ namespace }) => namespace)
+      .find((namespace) => item.relativePath.startsWith(`${namespace}/`));
+    if (!managedNamespace) return;
+    const namespacePath = absoluteTargetPath(root, managedNamespace);
+    let parent = dirname(path);
+    while (parent !== dirname(namespacePath)) {
+      const stats = lstatIfExists(parent);
+      if (
+        !stats?.isDirectory() ||
+        stats.isSymbolicLink() ||
+        readdirSync(parent).length > 0
+      ) {
+        break;
+      }
+      try {
+        rmdirSync(parent);
+      } catch {
+        break;
+      }
+      if (parent === namespacePath) break;
+      parent = dirname(parent);
+    }
   } catch (error) {
     throw new GuidanceError(`Could not remove obsolete ${item.relativePath}.`, { cause: error });
   }
@@ -1377,6 +1498,9 @@ export function syncProject(root, { takeover = "none" } = {}) {
     assertCanonicalSourceMatchesPlan(projectRoot, plan);
   } catch (error) {
     for (const stagedWrite of staged) removeStagedTemporary(stagedWrite);
+    for (const stagedWrite of [...staged].reverse()) {
+      removeCreatedDirectories(stagedWrite.createdDirectories);
+    }
     throw error;
   }
 
@@ -1385,6 +1509,9 @@ export function syncProject(root, { takeover = "none" } = {}) {
     for (const item of deletions) commitDeletion(projectRoot, item);
   } catch (error) {
     for (const stagedWrite of staged) removeStagedTemporary(stagedWrite);
+    for (const stagedWrite of [...staged].reverse()) {
+      removeCreatedDirectories(stagedWrite.createdDirectories);
+    }
     const committed = [
       ...staged.filter((stagedWrite) => stagedWrite.committed).map(({ item }) => item),
       ...deletions.filter((item) => item.committed),

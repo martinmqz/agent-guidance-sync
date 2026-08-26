@@ -19,7 +19,7 @@ import { dirname, join, relative, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import test from "node:test";
 import { setTimeout as delay } from "node:timers/promises";
-import { INITIAL_CONFIG, INITIAL_GUIDE, initProject } from "../src/index.mjs";
+import { INITIAL_CONFIG, INITIAL_GUIDE, initProject, renderTargets } from "../src/index.mjs";
 
 const packageRoot = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 const packageMetadata = JSON.parse(readFileSync(join(packageRoot, "package.json"), "utf8"));
@@ -351,6 +351,53 @@ test("generates deterministic always and path-activated rule adapters", (t) => {
   assert.doesNotMatch(read(root, "AGENTS.md"), /React Components/);
 });
 
+test("ignores auxiliary regular files in the canonical rules tree", (t) => {
+  const root = temporaryDirectory(t);
+  cpSync(join(scopedFixtureRoot, ".agents"), join(root, ".agents"), { recursive: true });
+  write(root, ".agents/rules/.DS_Store", "finder metadata\n");
+  write(root, ".agents/rules/.gitkeep", "");
+  write(root, ".agents/rules/README.md", "# Rule authoring notes\n");
+  write(root, ".agents/rules/frontend/react.md.swp", "editor state\n");
+
+  const sync = runCli(root, "sync");
+  assert.equal(sync.status, 0, sync.stderr);
+  assert.equal(runCli(root, "check").status, 0);
+  for (const relativePath of listFiles(scopedExpectedRoot)) {
+    assert.equal(read(root, relativePath), read(scopedExpectedRoot, relativePath));
+  }
+});
+
+test("strips a leading UTF-8 BOM from every canonical input", (t) => {
+  const root = temporaryDirectory(t);
+  cpSync(join(scopedFixtureRoot, ".agents"), join(root, ".agents"), { recursive: true });
+  for (const relativePath of [
+    ".agents/guide.md",
+    ".agents/config.yaml",
+    ".agents/rules/quality.md",
+    ".agents/rules/frontend/react.md",
+  ]) {
+    writeFileSync(join(root, relativePath), `\uFEFF${read(root, relativePath)}`);
+  }
+
+  const sync = runCli(root, "sync");
+  assert.equal(sync.status, 0, sync.stderr);
+  assert.equal(runCli(root, "check").status, 0);
+  for (const relativePath of listFiles(scopedExpectedRoot)) {
+    const contents = read(root, relativePath);
+    assert.equal(contents.includes("\uFEFF"), false, relativePath);
+    assert.equal(contents, read(scopedExpectedRoot, relativePath));
+  }
+});
+
+test("rendered targets expose only their consumed public fields", () => {
+  const [target] = renderTargets("# Guide\n");
+  assert.deepEqual(Object.keys(target).sort(), [
+    "contents",
+    "relativePath",
+    "unmanagedContents",
+  ]);
+});
+
 test("removes obsolete owned scoped outputs and preserves neighboring files", (t) => {
   const root = temporaryDirectory(t);
   cpSync(join(scopedFixtureRoot, ".agents"), join(root, ".agents"), { recursive: true });
@@ -376,6 +423,8 @@ test("removes obsolete owned scoped outputs and preserves neighboring files", (t
     ),
     null,
   );
+  assert.equal(lstatIfExists(join(root, ".cursor/rules/agent-guidance")), null);
+  assert.equal(lstatIfExists(join(root, ".github/instructions/agent-guidance")), null);
   assert.equal(read(root, ".cursor/rules/personal.mdc"), "# Personal Cursor guidance\n");
   assert.equal(
     read(root, ".github/instructions/personal.instructions.md"),
@@ -415,7 +464,7 @@ test("stale-output discovery never traverses parent directory symlinks", (t) => 
 adapters:
   agents: true
   claude: true
-  cursor: false
+  cursor: true
   copilot: true
 `,
   );
@@ -460,6 +509,52 @@ adapters:
   assert.match(namespaceSync.stderr, /generated path traverses a symlink: \.github\/instructions/);
   assert.equal(lstatIfExists(join(namespaceRoot, "AGENTS.md")), null);
   assert.match(read(outsideInstructions, stalePath), /source="\.agents\/rules\/stale\.md"/);
+});
+
+test("disabled adapters ignore unrelated symlinked vendor trees", (t) => {
+  const scenarios = [
+    {
+      config: `version: 1
+adapters:
+  agents: true
+  claude: true
+  cursor: false
+  copilot: true
+`,
+      disabledPath: ".cursor",
+      enabledPath: ".github/copilot-instructions.md",
+      name: "cursor",
+    },
+    {
+      config: `version: 1
+adapters:
+  agents: true
+  claude: true
+  cursor: true
+  copilot: false
+`,
+      disabledPath: ".github",
+      enabledPath: ".cursor/rules/agent-guidance.mdc",
+      name: "copilot",
+    },
+  ];
+
+  for (const scenario of scenarios) {
+    const root = temporaryRepo(t);
+    const outside = temporaryDirectory(t, `agent-guidance-disabled-${scenario.name}-outside-`);
+    writeFileSync(join(outside, "sentinel"), "outside\n");
+    if (!createSymlinkOrSkip(t, outside, join(root, scenario.disabledPath), "dir")) return;
+    writeFileSync(join(root, ".agents", "config.yaml"), scenario.config);
+
+    const sync = runCli(root, "sync");
+    assert.equal(sync.status, 0, sync.stderr);
+    assert.equal(lstatSync(join(root, scenario.disabledPath)).isSymbolicLink(), true);
+    assert.equal(readFileSync(join(outside, "sentinel"), "utf8"), "outside\n");
+    assert.ok(lstatIfExists(join(root, "AGENTS.md")));
+    assert.ok(lstatIfExists(join(root, "CLAUDE.md")));
+    assert.ok(lstatIfExists(join(root, scenario.enabledPath)));
+    assert.equal(runCli(root, "check").status, 0);
+  }
 });
 
 test("obsolete ownership requires an exact version and source-to-target mapping", (t) => {
@@ -532,6 +627,7 @@ test("blocks all writes for unmanaged files inside reserved generated namespaces
     const result = runCli(root, ...command);
     assert.equal(result.status, 1);
     assert.match(result.stderr, /unmanaged: \.cursor\/rules\/agent-guidance\/rogue\.mdc/);
+    assert.match(result.stderr, /move or remove it explicitly/);
     assert.equal(read(root, roguePath), "# Unmanaged reserved file\n");
     assert.equal(read(root, "AGENTS.md"), originalAgents);
   }
@@ -572,6 +668,8 @@ adapters:
     ),
     null,
   );
+  assert.equal(lstatIfExists(join(root, ".cursor/rules/agent-guidance")), null);
+  assert.equal(lstatIfExists(join(root, ".github/instructions/agent-guidance")), null);
   assert.equal(read(root, ".cursor/rules/personal.mdc"), "# Personal Cursor guidance\n");
   assert.equal(
     read(root, ".github/instructions/personal.instructions.md"),
@@ -1242,12 +1340,56 @@ test(
 );
 
 test(
+  "does not create parent directories through a symlink introduced during staging",
+  async (t) => {
+    const root = temporaryRepo(t);
+    const outside = temporaryDirectory(t, "agent-guidance-parent-race-outside-");
+    const probePath = join(root, ".agent-guidance-directory-symlink-probe");
+    if (!createSymlinkOrSkip(t, outside, probePath, "dir")) return;
+    rmSync(probePath);
+    writeFileSync(
+      join(root, ".agents", "guide.md"),
+      `# Large directory race fixture\n\n${"x".repeat(8 * 1024 * 1024)}\n`,
+    );
+
+    const { child, completed } = runCliAsync(root, "sync");
+    const deadline = Date.now() + 10_000;
+    let injected = false;
+    while (child.exitCode === null && Date.now() < deadline) {
+      const temporaryAgentFile = readdirSync(root).find(
+        (entry) => entry.startsWith(".AGENTS.md.") && entry.endsWith(".tmp"),
+      );
+      if (temporaryAgentFile) {
+        symlinkSync(
+          outside,
+          join(root, ".cursor"),
+          process.platform === "win32" ? "junction" : "dir",
+        );
+        injected = true;
+        break;
+      }
+      await delay(1);
+    }
+
+    const sync = await completed;
+    assert.equal(injected, true, `Could not intercept staged write; stderr: ${sync.stderr}`);
+    assert.equal(sync.status, 1);
+    assert.match(sync.stderr, /generated path traverses a symlink: \.cursor/);
+    assert.equal(lstatIfExists(join(outside, "rules")), null);
+    assert.equal(lstatSync(join(root, ".cursor")).isSymbolicLink(), true);
+    assert.equal(lstatIfExists(join(root, "AGENTS.md")), null);
+    assert.equal(lstatIfExists(join(root, "CLAUDE.md")), null);
+    assert.equal(listFiles(root).some((path) => path.endsWith(".tmp")), false);
+  },
+);
+
+test(
   "does not publish earlier targets when a later write cannot be staged",
   { skip: process.platform === "win32" },
   (t) => {
     const root = temporaryRepo(t);
-    const unwritableDirectory = join(root, ".cursor", "rules");
-    mkdirSync(unwritableDirectory, { recursive: true });
+    const unwritableDirectory = join(root, ".github");
+    mkdirSync(unwritableDirectory);
     chmodSync(unwritableDirectory, 0o555);
 
     let sync;
@@ -1258,10 +1400,11 @@ test(
     }
 
     assert.equal(sync.status, 1);
-    assert.match(sync.stderr, /Could not stage atomic write for \.cursor\/rules\/agent-guidance\.mdc/);
+    assert.match(sync.stderr, /Could not stage atomic write for \.github\/copilot-instructions\.md/);
     for (const relativePath of generatedPaths) {
       assert.equal(lstatIfExists(join(root, relativePath)), null);
     }
+    assert.equal(lstatIfExists(join(root, ".cursor")), null);
     assert.equal(listFiles(root).some((path) => path.endsWith(".tmp")), false);
   },
 );
@@ -1464,6 +1607,7 @@ test("reports missing sources and invalid CLI combinations without writing", (t)
   assert.match(commandHelp.stdout, /missing, stale, obsolete, unmanaged, or unsafe/);
   assert.match(commandHelp.stdout, /--dry-run/);
   assert.match(commandHelp.stdout, /--json/);
+  assert.match(commandHelp.stdout, /outside reserved namespaces/);
 
   const initHelp = runCli(root, "init", "--help");
   assert.equal(initHelp.status, 0, initHelp.stderr);
@@ -1472,6 +1616,7 @@ test("reports missing sources and invalid CLI combinations without writing", (t)
 });
 
 test("reports the package metadata version", () => {
+  assert.equal(packageMetadata.scripts.check, "node bin/agent-guidance.mjs check");
   const version = runCli(packageRoot, "--version");
   assert.equal(version.status, 0, version.stderr);
   assert.equal(version.stdout, `${packageMetadata.version}\n`);

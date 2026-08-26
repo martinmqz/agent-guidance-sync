@@ -128,6 +128,12 @@ space. Windows reserved device-name segments are also rejected. Plain values
 using YAML comments, mappings, collections, anchors, aliases, tags, or block
 syntax must be quoted when a literal string is intended.
 
+Only regular files with lowercase kebab-case `.md` names are treated as rules.
+Auxiliary regular files such as `.DS_Store`, `.gitkeep`, `README.md`, and editor
+swap files are ignored; symlinks and non-regular entries remain unsafe. A
+leading UTF-8 byte-order mark is stripped from the guide, config, and rule files
+before parsing or generation.
+
 The package installs the `agent-guidance` executable and generates:
 
 | Agent | Generated target |

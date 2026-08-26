@@ -16,7 +16,7 @@
     "README.md"
   ],
   "scripts": {
-    "check": "node --test",
+    "check": "node bin/agent-guidance.mjs check",
     "test": "node --test"
   },
   "engines": {

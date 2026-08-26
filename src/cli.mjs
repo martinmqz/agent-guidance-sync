@@ -31,7 +31,7 @@ Commands:
 Options:
   --adopt    Claim unmanaged files only when their payload already matches.
   --dry-run  Plan a sync without creating, changing, or removing files.
-  --force    Replace differing unmanaged regular files.
+  --force    Replace differing unmanaged regular files outside reserved namespaces.
   --json     Emit a versioned machine-readable result.
   --help     Show this help.
   --version  Show the package version.
