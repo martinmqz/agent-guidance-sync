@@ -1539,7 +1539,7 @@ function assertDirectoryStable(path, expectedStats, label, displayPath = path) {
 function readCanonicalRules(agentsPath) {
   const rulesPath = join(agentsPath, "rules");
   const rootStats = lstatIfExists(rulesPath);
-  if (!rootStats) return [];
+  if (!rootStats) return { directories: [], files: [] };
   if (rootStats.isSymbolicLink()) {
     throw new GuidanceError(`Canonical rules directory must not be a symlink: ${rulesPath}`);
   }
@@ -1547,6 +1547,7 @@ function readCanonicalRules(agentsPath) {
     throw new GuidanceError(`Canonical rules path is not a directory: ${rulesPath}`);
   }
 
+  const directorySnapshots = [];
   const ruleFiles = [];
   const visit = (directoryPath, relativeDirectory, expectedStats) => {
     withStableDirectory(
@@ -1601,7 +1602,12 @@ function readCanonicalRules(agentsPath) {
               `canonical rule ${relativePath}`,
               path,
             ),
+            displayPath: path,
+            name,
+            parentPath: directoryPath,
+            parentStats: expectedStats,
             relativePath,
+            stats,
           });
         }
         assertDirectoryStable(
@@ -1619,13 +1625,18 @@ function readCanonicalRules(agentsPath) {
             `Canonical rules directory changed while canonical guidance was being read: ${directoryPath}`,
           );
         }
+        directorySnapshots.push({
+          entries,
+          path: directoryPath,
+          stats: expectedStats,
+        });
       },
     );
   };
 
   visit(rulesPath, "", rootStats);
   assertDirectoryStable(rulesPath, rootStats, "Canonical rules directory", rulesPath);
-  return ruleFiles;
+  return { directories: directorySnapshots, files: ruleFiles };
 }
 
 function readCanonicalProject(root) {
@@ -1648,7 +1659,7 @@ function readCanonicalProject(root) {
   };
 
   assertSourceDirectoryIdentity();
-  const { configContents, guideContents, ruleFiles } = withStableDirectory(
+  const { configContents, configStats, guideContents, ruleFiles } = withStableDirectory(
     source.agentsPath,
     source.agentsStats,
     `Canonical source directory changed while guidance was being read: ${source.agentsPath}`,
@@ -1685,23 +1696,103 @@ function readCanonicalProject(root) {
         "Canonical source directory",
         source.agentsPath,
       );
-      return { configContents, guideContents, ruleFiles };
+      return { configContents, configStats, guideContents, ruleFiles };
     },
   );
   assertSourceDirectoryIdentity();
   return {
     config: parseConfig(configContents),
     guideContents,
-    rules: ruleFiles.map(({ contents, relativePath }) => parseRule(contents, relativePath)),
+    rules: ruleFiles.files.map(({ contents, relativePath }) => parseRule(contents, relativePath)),
+    snapshots: {
+      directories: [
+        { entries: null, path: source.agentsPath, stats: source.agentsStats },
+        ...ruleFiles.directories,
+      ],
+      files: [
+        {
+          contents: guideContents,
+          displayPath: source.sourcePath,
+          name: "guide.md",
+          parentPath: source.agentsPath,
+          parentStats: source.agentsStats,
+          stats: source.sourceStats,
+        },
+        {
+          contents: configContents,
+          displayPath: join(root, CONFIG_PATH),
+          name: "config.yaml",
+          parentPath: source.agentsPath,
+          parentStats: source.agentsStats,
+          stats: configStats,
+        },
+        ...ruleFiles.files,
+      ],
+    },
   };
+}
+
+function assertCanonicalSnapshotsUnchanged({ directories, files }) {
+  for (const snapshot of files) {
+    withStableDirectory(
+      snapshot.parentPath,
+      snapshot.parentStats,
+      `Canonical file parent changed after guidance was rendered: ${snapshot.displayPath}`,
+      () => {
+        const current = lstatIfExists(snapshot.name);
+        if (
+          !current?.isFile() ||
+          current.isSymbolicLink() ||
+          !hasSameFileIdentity(current, snapshot.stats) ||
+          readStableRegularFile(
+            snapshot.name,
+            current,
+            "canonical file",
+            snapshot.displayPath,
+          ) !== snapshot.contents
+        ) {
+          throw new GuidanceError(
+            `Canonical file changed after guidance was rendered: ${snapshot.displayPath}`,
+          );
+        }
+      },
+    );
+  }
+  for (const snapshot of directories) {
+    assertDirectoryStable(
+      snapshot.path,
+      snapshot.stats,
+      "Canonical directory",
+      snapshot.path,
+    );
+    if (snapshot.entries === null) continue;
+    withStableDirectory(
+      snapshot.path,
+      snapshot.stats,
+      `Canonical directory changed after guidance was rendered: ${snapshot.path}`,
+      () => {
+        const currentEntries = readdirSync(".").sort();
+        if (
+          snapshot.entries.length !== currentEntries.length ||
+          snapshot.entries.some((entry, index) => entry !== currentEntries[index])
+        ) {
+          throw new GuidanceError(
+            `Canonical directory changed after guidance was rendered: ${snapshot.path}`,
+          );
+        }
+      },
+    );
+  }
 }
 
 function renderCanonicalTargets(root) {
   const canonical = readCanonicalProject(root);
-  return renderTargets(canonical.guideContents, {
+  const targets = renderTargets(canonical.guideContents, {
     adapters: canonical.config.adapters,
     rules: canonical.rules,
   });
+  assertCanonicalSnapshotsUnchanged(canonical.snapshots);
+  return targets;
 }
 
 function planProjectWithRootIdentity(projectRoot, rootStats, takeover) {
@@ -2081,7 +2172,15 @@ function commitDeletion(root, item, rootIdentity) {
 
 function assertCanonicalSourceMatchesPlan(root, rootIdentity, plan) {
   assertProjectRootUnchanged(root, rootIdentity, "while canonical guidance was being verified");
-  const currentTargets = renderCanonicalTargets(root);
+  let currentTargets;
+  try {
+    currentTargets = renderCanonicalTargets(root);
+  } catch (error) {
+    throw new GuidanceError(
+      "Canonical source changed while guidance was being synchronized.",
+      { cause: error },
+    );
+  }
   assertProjectRootUnchanged(root, rootIdentity, "while canonical guidance was being verified");
   const plannedContents = new Map(
     plan
@@ -2098,7 +2197,7 @@ function assertCanonicalSourceMatchesPlan(root, rootIdentity, plan) {
   }
 }
 
-function assertTargetsMatchPlan(root, rootIdentity, plan, staged, deletions) {
+function assertTargetsMatchPlanPass(root, rootIdentity, plan, staged, deletions) {
   assertProjectRootUnchanged(root, rootIdentity, "while generated guidance was being verified");
   const enabledScopedNamespaces = Object.values(SCOPED_ADAPTERS)
     .filter(({ targetPath }) =>
@@ -2191,6 +2290,11 @@ function assertTargetsMatchPlan(root, rootIdentity, plan, staged, deletions) {
     }
   }
   assertProjectRootUnchanged(root, rootIdentity, "while generated guidance was being verified");
+}
+
+function assertTargetsMatchPlan(root, rootIdentity, plan, staged, deletions) {
+  assertTargetsMatchPlanPass(root, rootIdentity, plan, staged, deletions);
+  assertTargetsMatchPlanPass(root, rootIdentity, plan, staged, deletions);
 }
 
 export function checkProject(root) {

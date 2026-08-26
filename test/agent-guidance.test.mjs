@@ -2799,6 +2799,59 @@ if (!failureMessages.some((message) => /Canonical source changed while guidance 
   }
 });
 
+test("sync revalidates every canonical file after the final render", (t) => {
+  const root = temporaryRepo(t);
+  const script = `
+import fs from "node:fs";
+import { syncBuiltinESMExports } from "node:module";
+import { join } from "node:path";
+
+const root = ${JSON.stringify(root)};
+const originalOpenSync = fs.openSync;
+let canonicalRenderReads = 0;
+let changed = false;
+fs.openSync = (path, flags, mode) => {
+  const stack = new Error().stack ?? "";
+  if (
+    !changed &&
+    path === "config.yaml" &&
+    stack.includes("readCanonicalProject") &&
+    stack.includes("assertCanonicalSourceMatchesPlan")
+  ) {
+    canonicalRenderReads += 1;
+    if (canonicalRenderReads === 3) {
+      fs.writeFileSync(join(root, ".agents", "guide.md"), "# Concurrent final render\\n");
+      changed = true;
+    }
+  }
+  return originalOpenSync(path, flags, mode);
+};
+syncBuiltinESMExports();
+
+const { syncProject } = await import(${JSON.stringify(pathToFileURL(join(packageRoot, "src", "index.mjs")).href)});
+let failure = null;
+try {
+  syncProject(root);
+} catch (error) {
+  failure = error;
+}
+if (!changed) throw new Error("The canonical final-render change was not injected.");
+if (!failure) throw new Error("Synchronization accepted a canonical final-render change.");
+const failureMessages = [];
+for (let current = failure; current; current = current.cause) failureMessages.push(current.message);
+if (!failureMessages.some((message) => /Canonical source changed while guidance was being synchronized/.test(message))) {
+  throw failure;
+}
+`;
+  const result = spawnSync(process.execPath, ["--input-type=module", "--eval", script], {
+    encoding: "utf8",
+  });
+
+  assert.equal(result.status, 0, result.stderr);
+  assert.equal(runCli(root, "check").status, 1);
+  assert.equal(listFiles(root).some((path) => path.endsWith(".tmp")), false);
+});
+
 test("sync revalidates earlier targets after create, update, and deletion commits", (t) => {
   for (const action of ["create", "update", "delete"]) {
     const root = temporaryRepo(t);
@@ -2901,6 +2954,53 @@ if (!failureMessages.some((message) => /AGENTS\.md changed while guidance was be
     assert.equal(check.status, 1, `${action}: ${check.stderr}`);
     assert.equal(listFiles(root).some((path) => path.endsWith(".tmp")), false);
   }
+});
+
+test("sync repeats final target validation to detect changes during the first pass", (t) => {
+  const root = temporaryRepo(t);
+  assert.equal(runCli(root, "sync").status, 0);
+  rmSync(join(root, "CLAUDE.md"));
+
+  const script = `
+import fs from "node:fs";
+import { syncBuiltinESMExports } from "node:module";
+import { join } from "node:path";
+
+const root = ${JSON.stringify(root)};
+const originalOpenSync = fs.openSync;
+let changed = false;
+fs.openSync = (path, flags, mode) => {
+  const stack = new Error().stack ?? "";
+  if (!changed && path === "CLAUDE.md" && stack.includes("assertTargetsMatchPlan")) {
+    fs.writeFileSync(join(root, "AGENTS.md"), "concurrent final validation\\n");
+    changed = true;
+  }
+  return originalOpenSync(path, flags, mode);
+};
+syncBuiltinESMExports();
+
+const { syncProject } = await import(${JSON.stringify(pathToFileURL(join(packageRoot, "src", "index.mjs")).href)});
+let failure = null;
+try {
+  syncProject(root);
+} catch (error) {
+  failure = error;
+}
+if (!changed) throw new Error("The target final-pass change was not injected.");
+if (!failure) throw new Error("Synchronization accepted a target change during final validation.");
+const failureMessages = [];
+for (let current = failure; current; current = current.cause) failureMessages.push(current.message);
+if (!failureMessages.some((message) => /AGENTS\.md changed while guidance was being synchronized/.test(message))) {
+  throw failure;
+}
+`;
+  const result = spawnSync(process.execPath, ["--input-type=module", "--eval", script], {
+    encoding: "utf8",
+  });
+
+  assert.equal(result.status, 0, result.stderr);
+  assert.equal(runCli(root, "check").status, 1);
+  assert.equal(listFiles(root).some((path) => path.endsWith(".tmp")), false);
 });
 
 test("sync revalidates unchanged targets after create, update, and deletion commits", (t) => {
