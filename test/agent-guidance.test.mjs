@@ -3139,8 +3139,19 @@ fs.rmSync = (path, options) => {
 syncBuiltinESMExports();
 
 const { syncProject } = await import(${JSON.stringify(pathToFileURL(join(packageRoot, "src", "index.mjs")).href)});
-syncProject(root);
+let failure = null;
+try {
+  syncProject(root);
+} catch (error) {
+  failure = error;
+}
 if (!swapped) throw new Error("The deletion substitution was not injected.");
+if (!failure) throw new Error("Synchronization accepted an unsafe enabled namespace.");
+const failureMessages = [];
+for (let current = failure; current; current = current.cause) failureMessages.push(current.message);
+if (!failureMessages.some((message) => /generated path traverses a symlink/.test(message))) {
+  throw failure;
+}
 `;
     const result = spawnSync(process.execPath, ["--input-type=module", "--eval", script], {
       encoding: "utf8",
@@ -3150,6 +3161,7 @@ if (!swapped) throw new Error("The deletion substitution was not injected.");
     assert.doesNotMatch(result.stdout, /external-output-deleted/);
     assert.equal(readFileSync(join(outside, "react.mdc"), "utf8"), "outside\n");
     assert.deepEqual(listFiles(movedTargetParent), []);
+    assert.equal(runCli(root, "check").status, 1);
     assert.equal(listFiles(root).some((path) => path.endsWith(".tmp")), false);
   },
 );

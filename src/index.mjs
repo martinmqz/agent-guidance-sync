@@ -2100,6 +2100,13 @@ function assertCanonicalSourceMatchesPlan(root, rootIdentity, plan) {
 
 function assertTargetsMatchPlan(root, rootIdentity, plan, staged, deletions) {
   assertProjectRootUnchanged(root, rootIdentity, "while generated guidance was being verified");
+  const enabledScopedNamespaces = Object.values(SCOPED_ADAPTERS)
+    .filter(({ targetPath }) =>
+      plan.some(
+        (item) => item.relativePath === targetPath && typeof item.contents === "string",
+      )
+    )
+    .map(({ namespace }) => namespace);
   const stagedByPath = new Map(
     staged
       .filter((stagedWrite) => stagedWrite.committed)
@@ -2153,7 +2160,15 @@ function assertTargetsMatchPlan(root, rootIdentity, plan, staged, deletions) {
   for (const item of deletions) {
     if (!item.committed) continue;
     const issue = parentPathIssue(root, item.relativePath);
-    if (issue) continue;
+    if (issue) {
+      const enabledNamespace = enabledScopedNamespaces.find(
+        (namespace) => item.relativePath.startsWith(`${namespace}/`),
+      );
+      if (enabledNamespace) {
+        throw new GuidanceError(`${item.relativePath}: ${issue}`);
+      }
+      continue;
+    }
     const parentDirectories = inspectTargetParentDirectories(
       root,
       item.relativePath,
