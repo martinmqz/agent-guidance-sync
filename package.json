@@ -1,6 +1,6 @@
 {
   "name": "@martinmqz/agent-guidance-sync",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "Deterministically sync one canonical set of coding-agent guidance to AGENTS.md, CLAUDE.md, Cursor rules, and GitHub Copilot instructions.",
   "repository": {
     "type": "git",
