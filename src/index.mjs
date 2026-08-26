@@ -691,11 +691,11 @@ export function initProject(root) {
         closeSync(descriptor);
         descriptor = null;
         assertAgentsDirectoryUnchanged();
-        if (!temporaryFileIsOriginal(stagedWrite)) {
-          throw new GuidanceError(
-            `${source.relativePath} temporary file changed during initialization.`,
-          );
-        }
+        assertStagedFileUnchanged(
+          stagedWrite,
+          stagedWrite.temporaryPath,
+          `${source.relativePath} temporary file changed during initialization.`,
+        );
         if (inspectSource(source)) {
           existingPaths.add(source.relativePath);
           removeStagedTemporaryOrThrow(stagedWrite);
@@ -736,11 +736,11 @@ export function initProject(root) {
         removeStagedTemporaryOrThrow(stagedWrite);
         continue;
       }
-      if (!temporaryFileIsOriginal(stagedWrite)) {
-        throw new GuidanceError(
-          `${stagedWrite.item.relativePath} temporary file changed before initialization.`,
-        );
-      }
+      assertStagedFileUnchanged(
+        stagedWrite,
+        stagedWrite.temporaryPath,
+        `${stagedWrite.item.relativePath} temporary file changed before initialization.`,
+      );
       try {
         const publication = withStableDirectory(
           agentsPath,
@@ -772,6 +772,11 @@ export function initProject(root) {
               );
             }
             try {
+              assertStagedFileUnchanged(
+                stagedWrite,
+                targetName,
+                `${stagedWrite.item.relativePath} contents changed during initialization.`,
+              );
               assertAgentsDirectoryUnchanged();
             } catch (error) {
               if (hasSameFileIdentity(lstatIfExists(targetName), stagedWrite.temporaryIdentity)) {
@@ -1387,6 +1392,31 @@ function temporaryFileIsOriginal(staged, path = staged.temporaryPath) {
   );
 }
 
+function assertStagedFileUnchanged(staged, path, message) {
+  const stats = lstatIfExists(path);
+  if (
+    !stats?.isFile() ||
+    stats.isSymbolicLink() ||
+    !hasSameFileIdentity(stats, staged.temporaryIdentity)
+  ) {
+    throw new GuidanceError(message);
+  }
+
+  let contents;
+  try {
+    contents = readStableRegularFile(
+      path,
+      stats,
+      `staged temporary file for ${staged.item.relativePath}`,
+    );
+  } catch (error) {
+    throw new GuidanceError(message, { cause: error });
+  }
+  if (contents !== staged.item.contents) {
+    throw new GuidanceError(message);
+  }
+}
+
 function removeStagedTemporary(staged) {
   try {
     if (temporaryFileIsOriginal(staged)) {
@@ -1462,11 +1492,11 @@ function stageAtomicWrite(root, item) {
             temporaryName,
             temporaryPath,
           };
-          if (!temporaryFileIsOriginal(staged, temporaryName)) {
-            throw new GuidanceError(
-              `${item.relativePath} temporary file changed while being staged.`,
-            );
-          }
+          assertStagedFileUnchanged(
+            staged,
+            temporaryName,
+            `${item.relativePath} temporary file changed while being staged.`,
+          );
           const currentParent = lstatIfExists(parent);
           if (
             !currentParent?.isDirectory() ||
@@ -1525,11 +1555,11 @@ function commitStagedWrite(root, staged) {
       `${item.relativePath} parent directory changed before publication.`,
       () => {
         assertTargetAtPathUnchanged(targetName, item);
-        if (!temporaryFileIsOriginal(staged, temporaryName)) {
-          throw new GuidanceError(
-            `${item.relativePath} temporary file changed before publication.`,
-          );
-        }
+        assertStagedFileUnchanged(
+          staged,
+          temporaryName,
+          `${item.relativePath} temporary file changed before publication.`,
+        );
 
         if (item.originalContents === null) {
           linkSync(temporaryName, targetName);
@@ -1542,12 +1572,23 @@ function commitStagedWrite(root, staged) {
           ) {
             throw new GuidanceError(`${item.relativePath} changed during publication.`);
           }
-          const currentParent = lstatIfExists(parent);
-          if (
-            !currentParent?.isDirectory() ||
-            currentParent.isSymbolicLink() ||
-            !hasSameFileIdentity(currentParent, parentIdentity)
-          ) {
+          try {
+            assertStagedFileUnchanged(
+              staged,
+              targetName,
+              `${item.relativePath} contents changed during publication.`,
+            );
+            const currentParent = lstatIfExists(parent);
+            if (
+              !currentParent?.isDirectory() ||
+              currentParent.isSymbolicLink() ||
+              !hasSameFileIdentity(currentParent, parentIdentity)
+            ) {
+              throw new GuidanceError(
+                `${item.relativePath} parent directory changed during publication.`,
+              );
+            }
+          } catch (error) {
             if (hasSameFileIdentity(lstatIfExists(targetName), staged.temporaryIdentity)) {
               rmSync(targetName);
             }
@@ -1555,9 +1596,7 @@ function commitStagedWrite(root, staged) {
               rmSync(temporaryName, { force: true });
             }
             staged.committed = false;
-            throw new GuidanceError(
-              `${item.relativePath} parent directory changed during publication.`,
-            );
+            throw error;
           }
           if (temporaryFileIsOriginal(staged, temporaryName)) {
             rmSync(temporaryName, { force: true });
@@ -1579,6 +1618,11 @@ function commitStagedWrite(root, staged) {
         ) {
           throw new GuidanceError(`${item.relativePath} changed during publication.`);
         }
+        assertStagedFileUnchanged(
+          staged,
+          targetName,
+          `${item.relativePath} contents changed during publication.`,
+        );
         const currentParent = lstatIfExists(parent);
         if (
           !currentParent?.isDirectory() ||

@@ -393,6 +393,60 @@ if (!failureMessages.some((message) => /changed during initialization/.test(mess
   },
 );
 
+test("init rejects staged contents changed before publication", (t) => {
+  const root = temporaryDirectory(t);
+  mkdirSync(join(root, ".agents"));
+
+  const script = `
+import fs from "node:fs";
+import { syncBuiltinESMExports } from "node:module";
+import { basename } from "node:path";
+
+const root = ${JSON.stringify(root)};
+const originalOpenSync = fs.openSync;
+let stagedReads = 0;
+let tampered = false;
+fs.openSync = (path, flags, mode) => {
+  if (
+    !tampered &&
+    typeof path === "string" &&
+    typeof flags === "number" &&
+    basename(path).startsWith(".agent-guidance-init.guide.md.") &&
+    path.endsWith(".tmp")
+  ) {
+    stagedReads += 1;
+    if (stagedReads === 2) {
+      tampered = true;
+      fs.writeFileSync(path, "# Tampered initialization guidance\\n");
+    }
+  }
+  return originalOpenSync(path, flags, mode);
+};
+syncBuiltinESMExports();
+
+const { initProject } = await import(${JSON.stringify(pathToFileURL(join(packageRoot, "src", "index.mjs")).href)});
+let failure = null;
+try {
+  initProject(root);
+} catch (error) {
+  failure = error;
+}
+if (!tampered) throw new Error("The staged initialization file was not changed.");
+const failureMessages = [];
+for (let current = failure; current; current = current.cause) failureMessages.push(current.message);
+if (!failureMessages.some((message) => /temporary file changed before initialization/.test(message))) {
+  throw failure;
+}
+`;
+  const result = spawnSync(process.execPath, ["--input-type=module", "--eval", script], {
+    encoding: "utf8",
+  });
+
+  assert.equal(result.status, 0, result.stderr);
+  assert.deepEqual(listFiles(join(root, ".agents")), []);
+  assert.equal(listFiles(root).some((path) => path.endsWith(".tmp")), false);
+});
+
 test("init rejects non-directory and non-regular canonical source paths", (t) => {
   const directoryRoot = temporaryDirectory(t);
   writeFileSync(join(directoryRoot, ".agents"), "not a directory\n");
@@ -1692,6 +1746,78 @@ if (!failureMessages.some((message) => /parent directory changed during publicat
     assert.equal(listFiles(root).some((path) => path.endsWith(".tmp")), false);
   },
 );
+
+test("sync rejects staged contents changed before create or replacement publication", (t) => {
+  for (const action of ["create", "update"]) {
+    const root = temporaryRepo(t);
+    let generatedBefore = null;
+    if (action === "update") {
+      const initialSync = runCli(root, "sync");
+      assert.equal(initialSync.status, 0, initialSync.stderr);
+      generatedBefore = Object.fromEntries(
+        generatedPaths.map((relativePath) => [relativePath, read(root, relativePath)]),
+      );
+      writeFileSync(join(root, ".agents", "guide.md"), "# Updated guidance\n");
+    }
+
+    const script = `
+import fs from "node:fs";
+import { syncBuiltinESMExports } from "node:module";
+import { basename } from "node:path";
+
+const root = ${JSON.stringify(root)};
+const originalOpenSync = fs.openSync;
+let stagedReads = 0;
+let tampered = false;
+fs.openSync = (path, flags, mode) => {
+  if (
+    !tampered &&
+    typeof path === "string" &&
+    typeof flags === "number" &&
+    basename(path).startsWith(".AGENTS.md.") &&
+    path.endsWith(".tmp")
+  ) {
+    stagedReads += 1;
+    if (stagedReads === 2) {
+      tampered = true;
+      fs.writeFileSync(path, "tampered generated guidance\\n");
+    }
+  }
+  return originalOpenSync(path, flags, mode);
+};
+syncBuiltinESMExports();
+
+const { syncProject } = await import(${JSON.stringify(pathToFileURL(join(packageRoot, "src", "index.mjs")).href)});
+let failure = null;
+try {
+  syncProject(root);
+} catch (error) {
+  failure = error;
+}
+if (!tampered) throw new Error("The staged generated file was not changed.");
+const failureMessages = [];
+for (let current = failure; current; current = current.cause) failureMessages.push(current.message);
+if (!failureMessages.some((message) => /temporary file changed before publication/.test(message))) {
+  throw failure;
+}
+`;
+    const result = spawnSync(process.execPath, ["--input-type=module", "--eval", script], {
+      encoding: "utf8",
+    });
+
+    assert.equal(result.status, 0, `${action}: ${result.stderr}`);
+    if (action === "create") {
+      for (const relativePath of generatedPaths) {
+        assert.equal(lstatIfExists(join(root, relativePath)), null);
+      }
+    } else {
+      for (const relativePath of generatedPaths) {
+        assert.equal(read(root, relativePath), generatedBefore[relativePath]);
+      }
+    }
+    assert.equal(listFiles(root).some((path) => path.endsWith(".tmp")), false);
+  }
+});
 
 test(
   "deletes obsolete outputs through their verified parent directory",
