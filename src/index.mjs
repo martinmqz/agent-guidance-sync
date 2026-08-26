@@ -584,6 +584,7 @@ export function initProject(root) {
   if (!rootStats?.isDirectory() || rootStats.isSymbolicLink()) {
     throw new GuidanceError(`Project root must be a real directory: ${projectRoot}`);
   }
+  const rootChangedMessage = `Project root changed during initialization: ${projectRoot}`;
 
   const agentsPath = join(projectRoot, ".agents");
   let agentsStats = lstatIfExists(agentsPath);
@@ -619,7 +620,7 @@ export function initProject(root) {
     agentsStats = withStableDirectory(
       projectRoot,
       rootStats,
-      `Project root changed during initialization: ${projectRoot}`,
+      rootChangedMessage,
       () => {
         try {
           mkdirSync(".agents", { mode: 0o755 });
@@ -664,10 +665,9 @@ export function initProject(root) {
       }
 
       const path = absoluteTargetPath(projectRoot, source.relativePath);
-      const temporaryPath = join(
-        projectRoot,
-        `.agent-guidance-init.${basename(path)}.${process.pid}.${randomUUID()}.tmp`,
-      );
+      const temporaryName =
+        `.agent-guidance-init.${basename(path)}.${process.pid}.${randomUUID()}.tmp`;
+      const temporaryPath = join(projectRoot, temporaryName);
       let descriptor = null;
       let temporaryIdentity = null;
       const stagedWrite = {
@@ -680,22 +680,36 @@ export function initProject(root) {
         },
         path,
         temporaryIdentity: null,
+        temporaryName,
         temporaryPath,
       };
       try {
-        descriptor = openSync(temporaryPath, "wx", 0o666);
-        temporaryIdentity = fstatSync(descriptor);
-        stagedWrite.temporaryIdentity = temporaryIdentity;
-        writeFileSync(descriptor, source.contents, "utf8");
-        fsyncSync(descriptor);
-        closeSync(descriptor);
-        descriptor = null;
+        withStableDirectory(projectRoot, rootStats, rootChangedMessage, () => {
+          descriptor = openSync(temporaryName, "wx", 0o666);
+          temporaryIdentity = fstatSync(descriptor);
+          stagedWrite.temporaryIdentity = temporaryIdentity;
+          writeFileSync(descriptor, source.contents, "utf8");
+          fsyncSync(descriptor);
+          closeSync(descriptor);
+          descriptor = null;
+          const currentRoot = lstatIfExists(projectRoot);
+          if (
+            !currentRoot?.isDirectory() ||
+            currentRoot.isSymbolicLink() ||
+            !hasSameFileIdentity(currentRoot, rootStats)
+          ) {
+            if (temporaryFileIsOriginal(stagedWrite, temporaryName)) {
+              rmSync(temporaryName, { force: true });
+            }
+            throw new GuidanceError(rootChangedMessage);
+          }
+          assertStagedFileUnchanged(
+            stagedWrite,
+            temporaryName,
+            `${source.relativePath} temporary file changed during initialization.`,
+          );
+        });
         assertAgentsDirectoryUnchanged();
-        assertStagedFileUnchanged(
-          stagedWrite,
-          stagedWrite.temporaryPath,
-          `${source.relativePath} temporary file changed during initialization.`,
-        );
         if (inspectSource(source)) {
           existingPaths.add(source.relativePath);
           removeStagedTemporaryOrThrow(stagedWrite);
@@ -748,8 +762,16 @@ export function initProject(root) {
           changedMessage,
           () => {
             if (inspectSourceAtPath(targetName, stagedWrite.path)) return "existing";
+            const currentRoot = lstatIfExists("..");
+            if (
+              !currentRoot?.isDirectory() ||
+              currentRoot.isSymbolicLink() ||
+              !hasSameFileIdentity(currentRoot, rootStats)
+            ) {
+              throw new GuidanceError(rootChangedMessage);
+            }
             try {
-              linkSync(stagedWrite.temporaryPath, targetName);
+              linkSync(join("..", stagedWrite.temporaryName), targetName);
             } catch (error) {
               if (
                 error &&
@@ -843,22 +865,50 @@ function parentPathIssue(root, targetPath) {
   return null;
 }
 
+function removeEmptyDirectoryThroughParent(path, expectedIdentity) {
+  const parent = dirname(path);
+  const name = basename(path);
+  const parentStats = lstatIfExists(parent);
+  if (!parentStats?.isDirectory() || parentStats.isSymbolicLink()) return null;
+
+  try {
+    return withStableDirectory(
+      parent,
+      parentStats,
+      `Directory parent changed during cleanup: ${parent}`,
+      () => {
+        const current = lstatIfExists(name);
+        if (
+          !current?.isDirectory() ||
+          current.isSymbolicLink() ||
+          !hasSameFileIdentity(current, expectedIdentity)
+        ) {
+          return null;
+        }
+        let empty;
+        try {
+          empty = readdirSync(name).length === 0;
+        } catch {
+          return null;
+        }
+        const beforeRemoval = lstatIfExists(name);
+        if (!empty || !hasSameFileIdentity(beforeRemoval, expectedIdentity)) return null;
+        try {
+          rmdirSync(name);
+        } catch {
+          return null;
+        }
+        return { identity: parentStats, path: parent };
+      },
+    );
+  } catch {
+    return null;
+  }
+}
+
 function removeCreatedDirectories(createdDirectories) {
   for (const created of [...createdDirectories].reverse()) {
-    try {
-      const current = lstatIfExists(created.path);
-      if (
-        !current?.isDirectory() ||
-        current.isSymbolicLink() ||
-        !hasSameFileIdentity(current, created.identity) ||
-        readdirSync(created.path).length > 0
-      ) {
-        continue;
-      }
-      rmdirSync(created.path);
-    } catch {
-      // Directory cleanup is best-effort and never removes a changed or non-empty path.
-    }
+    removeEmptyDirectoryThroughParent(created.path, created.identity);
   }
 }
 
@@ -1664,23 +1714,12 @@ function commitDeletion(root, item) {
       .find((namespace) => item.relativePath.startsWith(`${namespace}/`));
     if (!managedNamespace) return;
     const namespacePath = absoluteTargetPath(root, managedNamespace);
-    let parent = dirname(path);
-    while (parent !== dirname(namespacePath)) {
-      const stats = lstatIfExists(parent);
-      if (
-        !stats?.isDirectory() ||
-        stats.isSymbolicLink() ||
-        readdirSync(parent).length > 0
-      ) {
-        break;
-      }
-      try {
-        rmdirSync(parent);
-      } catch {
-        break;
-      }
-      if (parent === namespacePath) break;
-      parent = dirname(parent);
+    const namespaceParent = dirname(namespacePath);
+    let current = { identity: targetParentStats, path: targetParent };
+    while (current.path !== namespaceParent) {
+      const removed = removeEmptyDirectoryThroughParent(current.path, current.identity);
+      if (!removed) break;
+      current = removed;
     }
   } catch (error) {
     throw new GuidanceError(`Could not remove obsolete ${item.relativePath}.`, { cause: error });

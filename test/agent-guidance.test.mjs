@@ -335,6 +335,71 @@ if (!failure || !/changed during initialization/.test(failure.message)) throw fa
 });
 
 test(
+  "init stages temporary files through the verified project root",
+  { skip: process.platform === "win32" },
+  (t) => {
+    const container = temporaryDirectory(t);
+    const root = join(container, "repo");
+    const movedRoot = join(container, "repo-original");
+    const outside = temporaryDirectory(t, "agent-guidance-init-root-race-outside-");
+    mkdirSync(join(root, ".agents"), { recursive: true });
+
+    const script = `
+import fs from "node:fs";
+import { syncBuiltinESMExports } from "node:module";
+import { dirname } from "node:path";
+
+const root = ${JSON.stringify(root)};
+const movedRoot = ${JSON.stringify(movedRoot)};
+const outside = ${JSON.stringify(outside)};
+const originalOpenSync = fs.openSync;
+let swapped = false;
+fs.openSync = (path, flags, mode) => {
+  if (!swapped && typeof path === "string" && path.endsWith(".tmp")) {
+    fs.renameSync(root, movedRoot);
+    fs.symlinkSync(outside, root, "dir");
+    swapped = true;
+  }
+  const descriptor = originalOpenSync(path, flags, mode);
+  if (
+    swapped &&
+    typeof path === "string" &&
+    fs.realpathSync(outside) === fs.realpathSync(dirname(path))
+  ) {
+    process.stdout.write("external-temp-opened\\n");
+  }
+  return descriptor;
+};
+syncBuiltinESMExports();
+
+const { initProject } = await import(${JSON.stringify(pathToFileURL(join(packageRoot, "src", "index.mjs")).href)});
+let failure = null;
+try {
+  initProject(root);
+} catch (error) {
+  failure = error;
+}
+if (!swapped) throw new Error("The project-root substitution was not injected.");
+const failureMessages = [];
+for (let current = failure; current; current = current.cause) failureMessages.push(current.message);
+if (!failureMessages.some((message) => /Project root changed during initialization/.test(message))) {
+  throw failure;
+}
+`;
+    const result = spawnSync(process.execPath, ["--input-type=module", "--eval", script], {
+      encoding: "utf8",
+    });
+
+    assert.equal(result.status, 0, result.stderr);
+    assert.doesNotMatch(result.stdout, /external-temp-opened/);
+    assert.deepEqual(listFiles(outside), []);
+    assert.equal(listFiles(movedRoot).some((path) => path.endsWith(".tmp")), false);
+    assert.equal(lstatSync(root).isSymbolicLink(), true);
+    assert.ok(lstatSync(movedRoot).isDirectory());
+  },
+);
+
+test(
   "init publishes through the verified source directory after its path is replaced",
   { skip: process.platform === "win32" },
   (t) => {
@@ -1877,6 +1942,133 @@ if (!swapped) throw new Error("The deletion substitution was not injected.");
     assert.equal(readFileSync(join(outside, "react.mdc"), "utf8"), "outside\n");
     assert.deepEqual(listFiles(movedTargetParent), []);
     assert.equal(listFiles(root).some((path) => path.endsWith(".tmp")), false);
+  },
+);
+
+test(
+  "prunes obsolete output directories only through verified ancestors",
+  { skip: process.platform === "win32" },
+  (t) => {
+    const root = temporaryDirectory(t);
+    cpSync(join(scopedFixtureRoot, ".agents"), join(root, ".agents"), { recursive: true });
+    assert.equal(runCli(root, "sync").status, 0);
+    rmSync(join(root, ".agents", "rules", "frontend", "react.md"));
+
+    const cursorPath = join(root, ".cursor");
+    const movedCursorPath = join(root, ".cursor-original");
+    const outside = temporaryDirectory(t, "agent-guidance-prune-outside-");
+    const outsideFrontend = join(outside, "rules", "agent-guidance", "frontend");
+    mkdirSync(outsideFrontend, { recursive: true });
+
+    const script = `
+import fs from "node:fs";
+import { syncBuiltinESMExports } from "node:module";
+import { basename } from "node:path";
+
+const root = ${JSON.stringify(root)};
+const cursorPath = ${JSON.stringify(cursorPath)};
+const movedCursorPath = ${JSON.stringify(movedCursorPath)};
+const outside = ${JSON.stringify(outside)};
+const originalRmSync = fs.rmSync;
+let swapped = false;
+fs.rmSync = (path, options) => {
+  const result = originalRmSync(path, options);
+  if (!swapped && typeof path === "string" && basename(path) === "react.mdc") {
+    fs.renameSync(cursorPath, movedCursorPath);
+    fs.symlinkSync(outside, cursorPath, "dir");
+    swapped = true;
+  }
+  return result;
+};
+syncBuiltinESMExports();
+
+const { syncProject } = await import(${JSON.stringify(pathToFileURL(join(packageRoot, "src", "index.mjs")).href)});
+syncProject(root);
+if (!swapped) throw new Error("The pruning ancestor substitution was not injected.");
+`;
+    const result = spawnSync(process.execPath, ["--input-type=module", "--eval", script], {
+      encoding: "utf8",
+    });
+
+    assert.equal(result.status, 0, result.stderr);
+    assert.equal(lstatSync(outsideFrontend).isDirectory(), true);
+    assert.equal(
+      lstatSync(join(movedCursorPath, "rules", "agent-guidance", "frontend")).isDirectory(),
+      true,
+    );
+    assert.equal(listFiles(root).some((path) => path.endsWith(".tmp")), false);
+  },
+);
+
+test(
+  "cleans created directories only through verified ancestors",
+  { skip: process.platform === "win32" },
+  (t) => {
+    const root = temporaryRepo(t);
+    const cursorPath = join(root, ".cursor");
+    const movedCursorPath = join(root, ".cursor-original");
+    const outside = temporaryDirectory(t, "agent-guidance-cleanup-outside-");
+    const outsideRules = join(outside, "rules");
+    mkdirSync(outsideRules);
+
+    const script = `
+import fs from "node:fs";
+import { syncBuiltinESMExports } from "node:module";
+import { basename } from "node:path";
+
+const root = ${JSON.stringify(root)};
+const cursorPath = ${JSON.stringify(cursorPath)};
+const movedCursorPath = ${JSON.stringify(movedCursorPath)};
+const outside = ${JSON.stringify(outside)};
+const originalOpenSync = fs.openSync;
+const originalRmdirSync = fs.rmdirSync;
+let failedStaging = false;
+let swapped = false;
+fs.openSync = (path, flags, mode) => {
+  if (
+    !failedStaging &&
+    typeof path === "string" &&
+    basename(path).startsWith(".copilot-instructions.md.") &&
+    path.endsWith(".tmp")
+  ) {
+    failedStaging = true;
+    const error = new Error("Injected staging failure.");
+    error.code = "EACCES";
+    throw error;
+  }
+  return originalOpenSync(path, flags, mode);
+};
+fs.rmdirSync = (path) => {
+  if (!swapped && typeof path === "string" && basename(path) === ".github") {
+    fs.renameSync(cursorPath, movedCursorPath);
+    fs.symlinkSync(outside, cursorPath, "dir");
+    swapped = true;
+  }
+  return originalRmdirSync(path);
+};
+syncBuiltinESMExports();
+
+const { syncProject } = await import(${JSON.stringify(pathToFileURL(join(packageRoot, "src", "index.mjs")).href)});
+let failure = null;
+try {
+  syncProject(root);
+} catch (error) {
+  failure = error;
+}
+if (!failedStaging) throw new Error("The staging failure was not injected.");
+if (!swapped) throw new Error("The cleanup ancestor substitution was not injected.");
+const failureMessages = [];
+for (let current = failure; current; current = current.cause) failureMessages.push(current.message);
+if (!failureMessages.some((message) => /Could not stage atomic write/.test(message))) throw failure;
+`;
+    const result = spawnSync(process.execPath, ["--input-type=module", "--eval", script], {
+      encoding: "utf8",
+    });
+
+    assert.equal(result.status, 0, result.stderr);
+    assert.equal(lstatSync(outsideRules).isDirectory(), true);
+    assert.equal(lstatSync(join(movedCursorPath, "rules")).isDirectory(), true);
+    assert.equal(listFiles(outside).some((path) => path.endsWith(".tmp")), false);
   },
 );
 
