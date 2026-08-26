@@ -1944,7 +1944,6 @@ function assertTargetsMatchPlan(root, rootIdentity, plan, staged, deletions) {
     if (typeof item.contents !== "string") continue;
     const stagedWrite = stagedByPath.get(item.relativePath);
     if (!stagedWrite) {
-      if (parentPathIssue(root, item.relativePath)) continue;
       try {
         assertTargetUnchanged(root, rootIdentity, item);
       } catch (error) {

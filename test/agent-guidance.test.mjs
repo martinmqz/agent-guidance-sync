@@ -2688,6 +2688,107 @@ if (!failureMessages.some((message) => /AGENTS\.md changed while guidance was be
 });
 
 test(
+  "sync rejects unsafe unchanged-target parents after create, update, and deletion commits",
+  { skip: process.platform === "win32" },
+  (t) => {
+    for (const action of ["create", "update", "delete"]) {
+      const root = temporaryRepo(t);
+      assert.equal(runCli(root, "sync").status, 0);
+      if (action === "create") {
+        rmSync(join(root, "CLAUDE.md"));
+      }
+      if (action === "update") {
+        const cursorPath = join(root, ".cursor", "rules", "agent-guidance.mdc");
+        writeFileSync(cursorPath, `${read(root, ".cursor/rules/agent-guidance.mdc")}stale\n`);
+      }
+      if (action === "delete") {
+        writeFileSync(
+          join(root, ".agents", "config.yaml"),
+          `version: 1
+adapters:
+  agents: true
+  claude: true
+  cursor: false
+  copilot: true
+`,
+        );
+      }
+
+      const originalGithubPath = join(root, ".github");
+      const movedGithubPath = join(root, ".github-original");
+      const outside = temporaryDirectory(t, `agent-guidance-${action}-unsafe-parent-`);
+      writeFileSync(join(outside, "copilot-instructions.md"), "outside\n");
+      const script = `
+import fs from "node:fs";
+import { syncBuiltinESMExports } from "node:module";
+import { basename } from "node:path";
+
+const root = ${JSON.stringify(root)};
+const action = ${JSON.stringify(action)};
+const originalGithubPath = ${JSON.stringify(originalGithubPath)};
+const movedGithubPath = ${JSON.stringify(movedGithubPath)};
+const outside = ${JSON.stringify(outside)};
+const originalLinkSync = fs.linkSync;
+const originalRenameSync = fs.renameSync;
+const originalRmSync = fs.rmSync;
+let swapped = false;
+const replaceGithubParent = () => {
+  if (swapped) return;
+  fs.renameSync(originalGithubPath, movedGithubPath);
+  fs.symlinkSync(outside, originalGithubPath, "dir");
+  swapped = true;
+};
+fs.linkSync = (source, destination) => {
+  const result = originalLinkSync(source, destination);
+  if (action === "create" && basename(destination) === "CLAUDE.md") replaceGithubParent();
+  return result;
+};
+fs.renameSync = (source, destination) => {
+  const result = originalRenameSync(source, destination);
+  if (action === "update" && basename(destination) === "agent-guidance.mdc") {
+    replaceGithubParent();
+  }
+  return result;
+};
+fs.rmSync = (path, options) => {
+  const result = originalRmSync(path, options);
+  if (action === "delete" && basename(path) === "agent-guidance.mdc") {
+    replaceGithubParent();
+  }
+  return result;
+};
+syncBuiltinESMExports();
+
+const { syncProject } = await import(${JSON.stringify(pathToFileURL(join(packageRoot, "src", "index.mjs")).href)});
+let failure = null;
+try {
+  syncProject(root);
+} catch (error) {
+  failure = error;
+}
+if (!swapped) throw new Error("The unchanged target parent was not replaced.");
+if (!failure) throw new Error("Synchronization accepted an unsafe unchanged-target parent.");
+const failureMessages = [];
+for (let current = failure; current; current = current.cause) failureMessages.push(current.message);
+if (!failureMessages.some((message) => /generated path traverses a symlink: \.github/.test(message))) {
+  throw failure;
+}
+`;
+      const result = spawnSync(process.execPath, ["--input-type=module", "--eval", script], {
+        encoding: "utf8",
+      });
+
+      assert.equal(result.status, 0, `${action}: ${result.stderr}`);
+      assert.equal(readFileSync(join(outside, "copilot-instructions.md"), "utf8"), "outside\n");
+      assert.ok(lstatIfExists(join(movedGithubPath, "copilot-instructions.md")));
+      const check = runCli(root, "check");
+      assert.equal(check.status, 1, `${action}: ${check.stderr}`);
+      assert.equal(listFiles(root).some((path) => path.endsWith(".tmp")), false);
+    }
+  },
+);
+
+test(
   "deletes obsolete outputs through their verified parent directory",
   { skip: process.platform === "win32" },
   (t) => {
@@ -2786,8 +2887,19 @@ fs.rmSync = (path, options) => {
 syncBuiltinESMExports();
 
 const { syncProject } = await import(${JSON.stringify(pathToFileURL(join(packageRoot, "src", "index.mjs")).href)});
-syncProject(root);
+let failure = null;
+try {
+  syncProject(root);
+} catch (error) {
+  failure = error;
+}
 if (!swapped) throw new Error("The pruning ancestor substitution was not injected.");
+if (!failure) throw new Error("Synchronization accepted the replaced generated ancestor.");
+const failureMessages = [];
+for (let current = failure; current; current = current.cause) failureMessages.push(current.message);
+if (!failureMessages.some((message) => /generated path traverses a symlink: \.cursor/.test(message))) {
+  throw failure;
+}
 `;
     const result = spawnSync(process.execPath, ["--input-type=module", "--eval", script], {
       encoding: "utf8",
