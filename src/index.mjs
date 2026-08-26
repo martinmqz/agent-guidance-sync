@@ -1933,15 +1933,39 @@ function assertCanonicalSourceMatchesPlan(root, rootIdentity, plan) {
   }
 }
 
-function assertCommittedTargetsMatchPlan(root, rootIdentity, staged, deletions) {
+function assertTargetsMatchPlan(root, rootIdentity, plan, staged, deletions) {
   assertProjectRootUnchanged(root, rootIdentity, "while generated guidance was being verified");
-  for (const stagedWrite of staged) {
-    if (!stagedWrite.committed) continue;
-    const { item, parent, parentIdentity, targetName, temporaryIdentity } = stagedWrite;
+  const stagedByPath = new Map(
+    staged
+      .filter((stagedWrite) => stagedWrite.committed)
+      .map((stagedWrite) => [stagedWrite.item.relativePath, stagedWrite]),
+  );
+  for (const item of plan) {
+    if (typeof item.contents !== "string") continue;
+    const stagedWrite = stagedByPath.get(item.relativePath);
+    if (!stagedWrite) {
+      if (parentPathIssue(root, item.relativePath)) continue;
+      try {
+        assertTargetUnchanged(root, rootIdentity, item);
+      } catch (error) {
+        throw new GuidanceError(
+          `${item.relativePath} changed while guidance was being synchronized.`,
+          { cause: error },
+        );
+      }
+      continue;
+    }
+    const {
+      item: stagedItem,
+      parent,
+      parentIdentity,
+      targetName,
+      temporaryIdentity,
+    } = stagedWrite;
     withStableDirectory(
       parent,
       parentIdentity,
-      `${item.relativePath} parent directory changed after publication.`,
+      `${stagedItem.relativePath} parent directory changed after publication.`,
       () => {
         assertProjectRootUnchanged(root, rootIdentity, "while generated guidance was being verified");
         const current = lstatIfExists(targetName);
@@ -1949,11 +1973,14 @@ function assertCommittedTargetsMatchPlan(root, rootIdentity, staged, deletions) 
           !current?.isFile() ||
           current.isSymbolicLink() ||
           !hasSameFileIdentity(current, temporaryIdentity) ||
-          readStableRegularFile(targetName, current, `generated target ${item.relativePath}`) !==
-            item.contents
+          readStableRegularFile(
+            targetName,
+            current,
+            `generated target ${stagedItem.relativePath}`,
+          ) !== stagedItem.contents
         ) {
           throw new GuidanceError(
-            `${item.relativePath} changed while guidance was being synchronized.`,
+            `${stagedItem.relativePath} changed while guidance was being synchronized.`,
           );
         }
       },
@@ -2025,7 +2052,7 @@ export function syncProject(root, { takeover = "none" } = {}) {
     }
     for (const item of deletions) commitDeletion(projectRoot, item, rootStats);
     assertCanonicalSourceMatchesPlan(projectRoot, rootStats, plan);
-    assertCommittedTargetsMatchPlan(projectRoot, rootStats, staged, deletions);
+    assertTargetsMatchPlan(projectRoot, rootStats, plan, staged, deletions);
   } catch (error) {
     for (const stagedWrite of staged) removeStagedTemporary(stagedWrite);
     for (const stagedWrite of [...staged].reverse()) {
