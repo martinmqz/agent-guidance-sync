@@ -750,6 +750,84 @@ adapters:
   assert.match(read(outsideInstructions, stalePath), /source="\.agents\/rules\/stale\.md"/);
 });
 
+test(
+  "traverses reserved generated namespaces through verified directories",
+  { skip: process.platform === "win32" },
+  (t) => {
+    const root = temporaryDirectory(t);
+    cpSync(join(scopedFixtureRoot, ".agents"), join(root, ".agents"), { recursive: true });
+    assert.equal(runCli(root, "sync").status, 0);
+    const originalAgents = read(root, "AGENTS.md");
+    writeFileSync(join(root, ".agents", "guide.md"), "# Updated guidance\n");
+
+    const namespacePath = join(root, ".cursor", "rules", "agent-guidance");
+    const movedNamespacePath = join(root, ".cursor", "rules", "agent-guidance-original");
+    const outside = temporaryDirectory(t, "agent-guidance-namespace-race-outside-");
+    writeFileSync(join(outside, "rogue.mdc"), "# External unmanaged rule\n");
+    const originalFiles = snapshotFiles(namespacePath);
+    const outsideFiles = snapshotFiles(outside);
+
+    const script = `
+import fs from "node:fs";
+import { syncBuiltinESMExports } from "node:module";
+
+const root = ${JSON.stringify(root)};
+const namespacePath = ${JSON.stringify(namespacePath)};
+const movedNamespacePath = ${JSON.stringify(movedNamespacePath)};
+const outside = ${JSON.stringify(outside)};
+const originalChdir = process.chdir;
+const originalReaddirSync = fs.readdirSync;
+let externalAccess = false;
+let insideNamespace = false;
+let swapped = false;
+process.chdir = (path) => {
+  const result = originalChdir(path);
+  if (path === namespacePath) insideNamespace = true;
+  return result;
+};
+fs.readdirSync = (path, options) => {
+  if (!swapped && (path === namespacePath || (insideNamespace && path === "."))) {
+    fs.renameSync(namespacePath, movedNamespacePath);
+    fs.symlinkSync(outside, namespacePath, "dir");
+    swapped = true;
+  }
+  const entries = originalReaddirSync(path, options);
+  if (swapped && entries.some((entry) => entry === "rogue.mdc" || entry?.name === "rogue.mdc")) {
+    externalAccess = true;
+  }
+  return entries;
+};
+syncBuiltinESMExports();
+
+const { syncProject } = await import(${JSON.stringify(pathToFileURL(join(packageRoot, "src", "index.mjs")).href)});
+let failure = null;
+try {
+  syncProject(root);
+} catch (error) {
+  failure = error;
+}
+if (!swapped) throw new Error("The reserved-namespace substitution was not injected.");
+if (externalAccess) throw new Error("Synchronization traversed the replacement namespace.");
+if (!failure) throw new Error("Synchronization accepted a replacement reserved namespace.");
+const failureMessages = [];
+for (let current = failure; current; current = current.cause) failureMessages.push(current.message);
+if (!failureMessages.some((message) => /Managed output directory changed/.test(message))) {
+  throw failure;
+}
+`;
+    const result = spawnSync(process.execPath, ["--input-type=module", "--eval", script], {
+      encoding: "utf8",
+    });
+
+    assert.equal(result.status, 0, result.stderr);
+    assert.deepEqual(snapshotFiles(movedNamespacePath), originalFiles);
+    assert.deepEqual(snapshotFiles(outside), outsideFiles);
+    assert.equal(lstatSync(namespacePath).isSymbolicLink(), true);
+    assert.equal(read(root, "AGENTS.md"), originalAgents);
+    assert.equal(listFiles(root).some((path) => path.endsWith(".tmp")), false);
+  },
+);
+
 test("disabled adapters ignore unrelated symlinked vendor trees", (t) => {
   const scenarios = [
     {

@@ -1100,68 +1100,93 @@ function classifyDisabledOwnedTargets(root, expectedPaths) {
 
 function classifyManagedRuleNamespaces(root, expectedPaths) {
   const items = [];
-  const visit = (directoryPath, relativeDirectory, expectedStats) => {
-    assertDirectoryStable(directoryPath, expectedStats, "Managed output directory");
-    const entries = readdirSync(directoryPath).sort();
-    for (const name of entries) {
-      const path = join(directoryPath, name);
-      const relativePath = `${relativeDirectory}/${name}`;
-      const stats = lstatIfExists(path);
-      if (!stats) {
-        throw new GuidanceError(`Managed output changed while being discovered: ${path}`);
-      }
-      if (stats.isSymbolicLink()) {
-        if (!expectedPaths.has(relativePath)) {
-          items.push({
-            action: "unsafe",
-            contents: null,
-            originalContents: null,
-            originalIdentity: null,
-            reason: "reserved generated namespace contains a symlink",
-            relativePath,
-          });
+  const visit = (directoryName, directoryPath, relativeDirectory, expectedStats) => {
+    withStableDirectory(
+      directoryName,
+      expectedStats,
+      `Managed output directory changed while being read: ${directoryPath}`,
+      () => {
+        const entries = readdirSync(".").sort();
+        for (const name of entries) {
+          const path = join(directoryPath, name);
+          const relativePath = `${relativeDirectory}/${name}`;
+          const stats = lstatIfExists(name);
+          if (!stats) {
+            throw new GuidanceError(`Managed output changed while being discovered: ${path}`);
+          }
+          if (stats.isSymbolicLink()) {
+            if (!expectedPaths.has(relativePath)) {
+              items.push({
+                action: "unsafe",
+                contents: null,
+                originalContents: null,
+                originalIdentity: null,
+                reason: "reserved generated namespace contains a symlink",
+                relativePath,
+              });
+            }
+            continue;
+          }
+          if (stats.isDirectory()) {
+            visit(name, path, relativePath, stats);
+            assertDirectoryStable(name, stats, "Managed output directory", path);
+            assertDirectoryStable(
+              ".",
+              expectedStats,
+              "Managed output directory",
+              directoryPath,
+            );
+            continue;
+          }
+          if (expectedPaths.has(relativePath)) continue;
+          if (!stats.isFile()) {
+            items.push({
+              action: "unsafe",
+              contents: null,
+              originalContents: null,
+              originalIdentity: null,
+              reason: "reserved generated namespace contains a non-regular file",
+              relativePath,
+            });
+            continue;
+          }
+          const contents = readStableRegularFile(
+            name,
+            stats,
+            `managed output ${relativePath}`,
+            path,
+          );
+          if (hasOwnedMarkerForPath(contents, relativePath)) {
+            items.push(deletionItem(relativePath, contents, stats));
+          } else {
+            items.push({
+              action: "conflict",
+              contents: null,
+              originalContents: contents,
+              originalIdentity: { dev: stats.dev, ino: stats.ino },
+              reason:
+                "unmanaged file is inside a reserved generated namespace; move or remove it explicitly",
+              relativePath,
+            });
+          }
         }
-        continue;
-      }
-      if (stats.isDirectory()) {
-        visit(path, relativePath, stats);
-        continue;
-      }
-      if (expectedPaths.has(relativePath)) continue;
-      if (!stats.isFile()) {
-        items.push({
-          action: "unsafe",
-          contents: null,
-          originalContents: null,
-          originalIdentity: null,
-          reason: "reserved generated namespace contains a non-regular file",
-          relativePath,
-        });
-        continue;
-      }
-      const contents = readStableRegularFile(path, stats, `managed output ${relativePath}`);
-      if (hasOwnedMarkerForPath(contents, relativePath)) {
-        items.push(deletionItem(relativePath, contents, stats));
-      } else {
-        items.push({
-          action: "conflict",
-          contents: null,
-          originalContents: contents,
-          originalIdentity: { dev: stats.dev, ino: stats.ino },
-          reason:
-            "unmanaged file is inside a reserved generated namespace; move or remove it explicitly",
-          relativePath,
-        });
-      }
-    }
-    assertDirectoryStable(directoryPath, expectedStats, "Managed output directory");
-    const currentEntries = readdirSync(directoryPath).sort();
-    if (
-      entries.length !== currentEntries.length ||
-      entries.some((entry, index) => entry !== currentEntries[index])
-    ) {
-      throw new GuidanceError(`Managed output directory changed while being read: ${directoryPath}`);
-    }
+        assertDirectoryStable(
+          ".",
+          expectedStats,
+          "Managed output directory",
+          directoryPath,
+        );
+        const currentEntries = readdirSync(".").sort();
+        if (
+          entries.length !== currentEntries.length ||
+          entries.some((entry, index) => entry !== currentEntries[index])
+        ) {
+          throw new GuidanceError(
+            `Managed output directory changed while being read: ${directoryPath}`,
+          );
+        }
+      },
+    );
   };
 
   for (const { namespace: relativeNamespace, targetPath } of Object.values(SCOPED_ADAPTERS)) {
@@ -1195,7 +1220,8 @@ function classifyManagedRuleNamespaces(root, expectedPaths) {
       });
       continue;
     }
-    visit(namespacePath, relativeNamespace, stats);
+    visit(namespacePath, namespacePath, relativeNamespace, stats);
+    assertDirectoryStable(namespacePath, stats, "Managed output directory");
   }
   return items;
 }
