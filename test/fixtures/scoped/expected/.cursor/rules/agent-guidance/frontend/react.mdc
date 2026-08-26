@@ -1,0 +1,11 @@
+---
+description: "React component guidance"
+globs: ["apps/web/**/*.tsx","packages/ui/**/*.tsx"]
+alwaysApply: false
+---
+
+<!-- agent-guidance-sync:generated:v1 source=".agents/rules/frontend/react.md" target=".cursor/rules/agent-guidance/frontend/react.mdc" -->
+
+# React Components
+
+Prefer observable behavior over implementation details.

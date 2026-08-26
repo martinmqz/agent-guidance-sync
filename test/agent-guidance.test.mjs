@@ -1,0 +1,3838 @@
+import assert from "node:assert/strict";
+import { spawn, spawnSync } from "node:child_process";
+import {
+  chmodSync,
+  cpSync,
+  lstatSync,
+  mkdirSync,
+  mkdtempSync,
+  readFileSync,
+  readdirSync,
+  realpathSync,
+  rmSync,
+  statSync,
+  symlinkSync,
+  writeFileSync,
+} from "node:fs";
+import { tmpdir } from "node:os";
+import { dirname, join, relative, resolve } from "node:path";
+import { fileURLToPath, pathToFileURL } from "node:url";
+import test from "node:test";
+import { setTimeout as delay } from "node:timers/promises";
+import { INITIAL_CONFIG, INITIAL_GUIDE, initProject, renderTargets } from "../src/index.mjs";
+
+const packageRoot = resolve(dirname(fileURLToPath(import.meta.url)), "..");
+const packageMetadata = JSON.parse(readFileSync(join(packageRoot, "package.json"), "utf8"));
+const cliPath = join(packageRoot, "bin", "agent-guidance.mjs");
+const fixtureRoot = join(packageRoot, "test", "fixtures", "basic");
+const expectedRoot = join(fixtureRoot, "expected");
+const scopedFixtureRoot = join(packageRoot, "test", "fixtures", "scoped");
+const scopedExpectedRoot = join(scopedFixtureRoot, "expected");
+const generatedPaths = [
+  "AGENTS.md",
+  "CLAUDE.md",
+  ".cursor/rules/agent-guidance.mdc",
+  ".github/copilot-instructions.md",
+];
+
+function temporaryDirectory(t, prefix = "agent-guidance-sync-") {
+  const path = mkdtempSync(join(tmpdir(), prefix));
+  t.after(() => rmSync(path, { recursive: true, force: true }));
+  return path;
+}
+
+function temporaryRepo(t) {
+  const root = temporaryDirectory(t);
+  cpSync(join(fixtureRoot, ".agents"), join(root, ".agents"), { recursive: true });
+  return root;
+}
+
+function runCli(root, ...arguments_) {
+  return spawnSync(process.execPath, [cliPath, ...arguments_], {
+    cwd: root,
+    encoding: "utf8",
+  });
+}
+
+function runCliAsync(root, ...arguments_) {
+  const child = spawn(process.execPath, [cliPath, ...arguments_], { cwd: root });
+  let stderr = "";
+  let stdout = "";
+  child.stderr.setEncoding("utf8");
+  child.stdout.setEncoding("utf8");
+  child.stderr.on("data", (chunk) => {
+    stderr += chunk;
+  });
+  child.stdout.on("data", (chunk) => {
+    stdout += chunk;
+  });
+  const completed = new Promise((resolveCompletion, rejectCompletion) => {
+    child.once("error", rejectCompletion);
+    child.once("close", (status, signal) => {
+      resolveCompletion({ signal, status, stderr, stdout });
+    });
+  });
+  return { child, completed };
+}
+
+function read(root, relativePath) {
+  return readFileSync(join(root, relativePath), "utf8");
+}
+
+function write(root, relativePath, contents) {
+  const path = join(root, relativePath);
+  mkdirSync(dirname(path), { recursive: true });
+  writeFileSync(path, contents);
+}
+
+function createSymlinkOrSkip(t, target, path, type) {
+  try {
+    symlinkSync(target, path, process.platform === "win32" && type === "dir" ? "junction" : type);
+    return true;
+  } catch (error) {
+    if (
+      process.platform === "win32" &&
+      error &&
+      typeof error === "object" &&
+      ["EACCES", "ENOSYS", "EPERM"].includes(error.code)
+    ) {
+      t.skip(`Windows runner cannot create the required ${type} symlink: ${error.code}`);
+      return false;
+    }
+    throw error;
+  }
+}
+
+function listFiles(root, current = root) {
+  const files = [];
+  for (const entry of readdirSync(current, { withFileTypes: true })) {
+    const path = join(current, entry.name);
+    if (entry.isDirectory()) files.push(...listFiles(root, path));
+    else files.push(relative(root, path).replaceAll("\\", "/"));
+  }
+  return files.sort();
+}
+
+function snapshotFiles(root) {
+  return Object.fromEntries(
+    listFiles(root).map((relativePath) => [relativePath, read(root, relativePath)]),
+  );
+}
+
+test("initializes the Git repository root without generating targets", (t) => {
+  const root = temporaryDirectory(t);
+  const nested = join(root, "packages", "app");
+  mkdirSync(join(root, ".git"));
+  mkdirSync(nested, { recursive: true });
+
+  const init = runCli(nested, "init");
+  assert.equal(init.status, 0, init.stderr);
+  assert.match(init.stdout, /Initialized agent guidance/);
+  assert.match(init.stdout, /created: \.agents\/guide\.md/);
+  assert.match(init.stdout, /created: \.agents\/config\.yaml/);
+  assert.equal(read(root, ".agents/guide.md"), INITIAL_GUIDE);
+  assert.equal(read(root, ".agents/config.yaml"), INITIAL_CONFIG);
+  assert.equal(lstatIfExists(join(nested, ".agents")), null);
+  for (const relativePath of generatedPaths) {
+    assert.equal(lstatIfExists(join(root, relativePath)), null);
+  }
+  assert.equal(listFiles(root).some((path) => path.endsWith(".tmp")), false);
+});
+
+test("initializes the current directory when no Git repository is present", (t) => {
+  const root = temporaryDirectory(t);
+  const nested = join(root, "standalone");
+  mkdirSync(nested);
+
+  const init = runCli(nested, "init");
+  assert.equal(init.status, 0, init.stderr);
+  assert.equal(read(nested, ".agents/guide.md"), INITIAL_GUIDE);
+  assert.equal(read(nested, ".agents/config.yaml"), INITIAL_CONFIG);
+  assert.equal(lstatIfExists(join(root, ".agents")), null);
+});
+
+test("init reuses the nearest existing canonical source before the Git root", (t) => {
+  const root = temporaryDirectory(t);
+  const nested = join(root, "packages", "app");
+  const descendant = join(nested, "src", "feature");
+  mkdirSync(join(root, ".git"));
+  mkdirSync(descendant, { recursive: true });
+  write(nested, ".agents/guide.md", "# Nested package guidance\n");
+
+  const init = runCli(descendant, "init");
+  assert.equal(init.status, 0, init.stderr);
+  assert.equal(read(nested, ".agents/guide.md"), "# Nested package guidance\n");
+  assert.equal(read(nested, ".agents/config.yaml"), INITIAL_CONFIG);
+  assert.equal(lstatIfExists(join(root, ".agents")), null);
+});
+
+test("init is idempotent and never overwrites an existing canonical source", (t) => {
+  const root = temporaryDirectory(t);
+  const existingGuide = "# Existing repository guidance\n";
+  write(root, ".agents/guide.md", existingGuide);
+
+  const init = runCli(root, "init");
+  assert.equal(init.status, 0, init.stderr);
+  assert.match(init.stdout, /created: \.agents\/config\.yaml/);
+  assert.equal(read(root, ".agents/guide.md"), existingGuide);
+  assert.equal(read(root, ".agents/config.yaml"), INITIAL_CONFIG);
+
+  const secondInit = runCli(root, "init");
+  assert.equal(secondInit.status, 0, secondInit.stderr);
+  assert.match(secondInit.stdout, /already initialized/);
+  assert.equal(read(root, ".agents/guide.md"), existingGuide);
+});
+
+test(
+  "init can add missing config without reading an existing guide",
+  { skip: process.platform === "win32" },
+  (t) => {
+    const root = temporaryDirectory(t);
+    const guidePath = join(root, ".agents", "guide.md");
+    write(root, ".agents/guide.md", "# Existing unreadable guide\n");
+    chmodSync(guidePath, 0o000);
+
+    let init;
+    try {
+      init = runCli(root, "init");
+    } finally {
+      chmodSync(guidePath, 0o600);
+    }
+
+    assert.equal(init.status, 0, init.stderr);
+    assert.match(init.stdout, /created: \.agents\/config\.yaml/);
+    assert.equal(read(root, ".agents/guide.md"), "# Existing unreadable guide\n");
+    assert.equal(read(root, ".agents/config.yaml"), INITIAL_CONFIG);
+  },
+);
+
+test(
+  "init creates the canonical source directory with bounded permissions",
+  { skip: process.platform === "win32" },
+  (t) => {
+    const root = temporaryDirectory(t);
+    const previousUmask = process.umask(0o000);
+    let init;
+    try {
+      init = runCli(root, "init");
+    } finally {
+      process.umask(previousUmask);
+    }
+
+    assert.equal(init.status, 0, init.stderr);
+    assert.equal(statSync(join(root, ".agents")).mode & 0o777, 0o755);
+  },
+);
+
+test("init preserves its public result contract while exposing created paths", (t) => {
+  const root = temporaryDirectory(t);
+  const initialized = initProject(root);
+  assert.equal(initialized.created, true);
+  assert.equal(initialized.createdAny, true);
+  assert.deepEqual(initialized.createdPaths, [".agents/guide.md", ".agents/config.yaml"]);
+  assert.equal(initialized.sourcePath, join(root, ".agents", "guide.md"));
+
+  const repeated = initProject(root);
+  assert.equal(repeated.created, false);
+  assert.equal(repeated.createdAny, false);
+  assert.deepEqual(repeated.createdPaths, []);
+  assert.deepEqual(repeated.existingPaths, [".agents/guide.md", ".agents/config.yaml"]);
+
+  const migrationRoot = temporaryDirectory(t);
+  write(migrationRoot, ".agents/guide.md", "# Existing guide\n");
+  const migrated = initProject(migrationRoot);
+  assert.equal(migrated.created, false);
+  assert.equal(migrated.createdAny, true);
+  assert.deepEqual(migrated.createdPaths, [".agents/config.yaml"]);
+});
+
+test("concurrent init calls converge without overwriting canonical files", async (t) => {
+  const root = temporaryDirectory(t);
+  const attempts = Array.from({ length: 12 }, () => runCliAsync(root, "init").completed);
+  const results = await Promise.all(attempts);
+  for (const result of results) assert.equal(result.status, 0, result.stderr);
+  assert.equal(read(root, ".agents/guide.md"), INITIAL_GUIDE);
+  assert.equal(read(root, ".agents/config.yaml"), INITIAL_CONFIG);
+  assert.equal(listFiles(root).some((path) => path.endsWith(".tmp")), false);
+});
+
+test("init rejects symlinked canonical source paths without following them", (t) => {
+  const directoryRoot = temporaryDirectory(t);
+  const outsideDirectory = temporaryDirectory(t, "agent-guidance-init-outside-");
+  if (!createSymlinkOrSkip(t, outsideDirectory, join(directoryRoot, ".agents"), "dir")) return;
+
+  const directoryResult = runCli(directoryRoot, "init");
+  assert.equal(directoryResult.status, 1);
+  assert.match(directoryResult.stderr, /Canonical source directory must not be a symlink/);
+  assert.deepEqual(listFiles(outsideDirectory), []);
+
+  const fileRoot = temporaryDirectory(t);
+  mkdirSync(join(fileRoot, ".agents"));
+  const outsideGuide = join(outsideDirectory, "outside-guide.md");
+  writeFileSync(outsideGuide, "# Outside guide\n");
+  if (!createSymlinkOrSkip(t, outsideGuide, join(fileRoot, ".agents", "guide.md"), "file")) return;
+
+  const fileResult = runCli(fileRoot, "init");
+  assert.equal(fileResult.status, 1);
+  assert.match(fileResult.stderr, /Canonical source must not be a symlink/);
+  assert.equal(readFileSync(outsideGuide, "utf8"), "# Outside guide\n");
+
+  const configRoot = temporaryDirectory(t);
+  mkdirSync(join(configRoot, ".agents"));
+  if (!createSymlinkOrSkip(t, outsideGuide, join(configRoot, ".agents", "config.yaml"), "file")) {
+    return;
+  }
+  const configResult = runCli(configRoot, "init");
+  assert.equal(configResult.status, 1);
+  assert.match(configResult.stderr, /Canonical source must not be a symlink/);
+  assert.equal(lstatIfExists(join(configRoot, ".agents", "guide.md")), null);
+});
+
+test("init never stages temporary files through a replaced source directory", (t) => {
+  const root = temporaryDirectory(t);
+  const agentsPath = join(root, ".agents");
+  const movedAgentsPath = join(root, ".agents-original");
+  const outside = temporaryDirectory(t, "agent-guidance-init-race-outside-");
+  mkdirSync(agentsPath);
+  const probePath = join(root, ".agent-guidance-init-race-probe");
+  if (!createSymlinkOrSkip(t, outside, probePath, "dir")) return;
+  rmSync(probePath);
+
+  const script = `
+import fs from "node:fs";
+import { syncBuiltinESMExports } from "node:module";
+import { dirname } from "node:path";
+
+const root = ${JSON.stringify(root)};
+const agentsPath = ${JSON.stringify(agentsPath)};
+const movedAgentsPath = ${JSON.stringify(movedAgentsPath)};
+const outside = ${JSON.stringify(outside)};
+const originalOpenSync = fs.openSync;
+let swapped = false;
+fs.openSync = (path, flags, mode) => {
+  if (!swapped && typeof path === "string" && path.endsWith(".tmp")) {
+    fs.renameSync(agentsPath, movedAgentsPath);
+    fs.symlinkSync(outside, agentsPath, process.platform === "win32" ? "junction" : "dir");
+    swapped = true;
+  }
+  const descriptor = originalOpenSync(path, flags, mode);
+  if (
+    swapped &&
+    typeof path === "string" &&
+    fs.realpathSync(${JSON.stringify(outside)}) === fs.realpathSync(dirname(path))
+  ) {
+    process.stdout.write("external-temp-opened\\n");
+  }
+  return descriptor;
+};
+syncBuiltinESMExports();
+
+const { initProject } = await import(${JSON.stringify(pathToFileURL(join(packageRoot, "src", "index.mjs")).href)});
+let failure = null;
+try {
+  initProject(root);
+} catch (error) {
+  failure = error;
+}
+if (!swapped) throw new Error("The source-directory substitution was not injected.");
+if (!failure || !/changed during initialization/.test(failure.message)) throw failure;
+`;
+  const result = spawnSync(process.execPath, ["--input-type=module", "--eval", script], {
+    encoding: "utf8",
+  });
+
+  assert.equal(result.status, 0, result.stderr);
+  assert.doesNotMatch(result.stdout, /external-temp-opened/);
+  assert.deepEqual(listFiles(outside), []);
+  assert.equal(listFiles(root).some((path) => path.endsWith(".tmp")), false);
+  assert.equal(lstatSync(agentsPath).isSymbolicLink(), true);
+  assert.ok(lstatSync(movedAgentsPath).isDirectory());
+});
+
+test(
+  "init stages temporary files through the verified project root",
+  { skip: process.platform === "win32" },
+  (t) => {
+    const container = temporaryDirectory(t);
+    const root = join(container, "repo");
+    const movedRoot = join(container, "repo-original");
+    const outside = temporaryDirectory(t, "agent-guidance-init-root-race-outside-");
+    mkdirSync(join(root, ".agents"), { recursive: true });
+
+    const script = `
+import fs from "node:fs";
+import { syncBuiltinESMExports } from "node:module";
+import { dirname } from "node:path";
+
+const root = ${JSON.stringify(root)};
+const movedRoot = ${JSON.stringify(movedRoot)};
+const outside = ${JSON.stringify(outside)};
+const originalOpenSync = fs.openSync;
+let swapped = false;
+fs.openSync = (path, flags, mode) => {
+  if (!swapped && typeof path === "string" && path.endsWith(".tmp")) {
+    fs.renameSync(root, movedRoot);
+    fs.symlinkSync(outside, root, "dir");
+    swapped = true;
+  }
+  const descriptor = originalOpenSync(path, flags, mode);
+  if (
+    swapped &&
+    typeof path === "string" &&
+    fs.realpathSync(outside) === fs.realpathSync(dirname(path))
+  ) {
+    process.stdout.write("external-temp-opened\\n");
+  }
+  return descriptor;
+};
+syncBuiltinESMExports();
+
+const { initProject } = await import(${JSON.stringify(pathToFileURL(join(packageRoot, "src", "index.mjs")).href)});
+let failure = null;
+try {
+  initProject(root);
+} catch (error) {
+  failure = error;
+}
+if (!swapped) throw new Error("The project-root substitution was not injected.");
+const failureMessages = [];
+for (let current = failure; current; current = current.cause) failureMessages.push(current.message);
+if (!failureMessages.some((message) => /Project root changed during initialization/.test(message))) {
+  throw failure;
+}
+`;
+    const result = spawnSync(process.execPath, ["--input-type=module", "--eval", script], {
+      encoding: "utf8",
+    });
+
+    assert.equal(result.status, 0, result.stderr);
+    assert.doesNotMatch(result.stdout, /external-temp-opened/);
+    assert.deepEqual(listFiles(outside), []);
+    assert.equal(listFiles(movedRoot).some((path) => path.endsWith(".tmp")), false);
+    assert.equal(lstatSync(root).isSymbolicLink(), true);
+    assert.ok(lstatSync(movedRoot).isDirectory());
+  },
+);
+
+test(
+  "init publishes through the verified source directory after its path is replaced",
+  { skip: process.platform === "win32" },
+  (t) => {
+    const root = temporaryDirectory(t);
+    const agentsPath = join(root, ".agents");
+    const movedAgentsPath = join(root, ".agents-original");
+    const outside = temporaryDirectory(t, "agent-guidance-init-publish-outside-");
+    mkdirSync(agentsPath);
+
+    const script = `
+import fs from "node:fs";
+import { syncBuiltinESMExports } from "node:module";
+import { basename, join } from "node:path";
+
+const root = ${JSON.stringify(root)};
+const agentsPath = ${JSON.stringify(agentsPath)};
+const movedAgentsPath = ${JSON.stringify(movedAgentsPath)};
+const outside = ${JSON.stringify(outside)};
+const originalLinkSync = fs.linkSync;
+let swapped = false;
+fs.linkSync = (source, destination) => {
+  if (!swapped && typeof destination === "string" && basename(destination) === "guide.md") {
+    fs.renameSync(agentsPath, movedAgentsPath);
+    fs.symlinkSync(outside, agentsPath, "dir");
+    swapped = true;
+  }
+  const result = originalLinkSync(source, destination);
+  if (fs.existsSync(join(outside, "guide.md"))) {
+    process.stdout.write("external-guide-published\\n");
+  }
+  return result;
+};
+syncBuiltinESMExports();
+
+const { initProject } = await import(${JSON.stringify(pathToFileURL(join(packageRoot, "src", "index.mjs")).href)});
+let failure = null;
+try {
+  initProject(root);
+} catch (error) {
+  failure = error;
+}
+if (!swapped) throw new Error("The publication substitution was not injected.");
+const failureMessages = [];
+for (let current = failure; current; current = current.cause) failureMessages.push(current.message);
+if (!failureMessages.some((message) => /changed during initialization/.test(message))) throw failure;
+`;
+    const result = spawnSync(process.execPath, ["--input-type=module", "--eval", script], {
+      encoding: "utf8",
+    });
+
+    assert.equal(result.status, 0, result.stderr);
+    assert.doesNotMatch(result.stdout, /external-guide-published/);
+    assert.deepEqual(listFiles(outside), []);
+    assert.deepEqual(listFiles(movedAgentsPath), []);
+    assert.equal(listFiles(root).some((path) => path.endsWith(".tmp")), false);
+  },
+);
+
+test("init rejects staged contents changed before publication", (t) => {
+  const root = temporaryDirectory(t);
+  mkdirSync(join(root, ".agents"));
+
+  const script = `
+import fs from "node:fs";
+import { syncBuiltinESMExports } from "node:module";
+import { basename } from "node:path";
+
+const root = ${JSON.stringify(root)};
+const originalOpenSync = fs.openSync;
+let stagedReads = 0;
+let tampered = false;
+fs.openSync = (path, flags, mode) => {
+  if (
+    !tampered &&
+    typeof path === "string" &&
+    typeof flags === "number" &&
+    basename(path).startsWith(".agent-guidance-init.guide.md.") &&
+    path.endsWith(".tmp")
+  ) {
+    stagedReads += 1;
+    if (stagedReads === 2) {
+      tampered = true;
+      fs.writeFileSync(path, "# Tampered initialization guidance\\n");
+    }
+  }
+  return originalOpenSync(path, flags, mode);
+};
+syncBuiltinESMExports();
+
+const { initProject } = await import(${JSON.stringify(pathToFileURL(join(packageRoot, "src", "index.mjs")).href)});
+let failure = null;
+try {
+  initProject(root);
+} catch (error) {
+  failure = error;
+}
+if (!tampered) throw new Error("The staged initialization file was not changed.");
+const failureMessages = [];
+for (let current = failure; current; current = current.cause) failureMessages.push(current.message);
+if (!failureMessages.some((message) => /temporary file changed before initialization/.test(message))) {
+  throw failure;
+}
+`;
+  const result = spawnSync(process.execPath, ["--input-type=module", "--eval", script], {
+    encoding: "utf8",
+  });
+
+  assert.equal(result.status, 0, result.stderr);
+  assert.deepEqual(listFiles(join(root, ".agents")), []);
+  assert.equal(listFiles(root).some((path) => path.endsWith(".tmp")), false);
+});
+
+test("init rejects non-directory and non-regular canonical source paths", (t) => {
+  const directoryRoot = temporaryDirectory(t);
+  writeFileSync(join(directoryRoot, ".agents"), "not a directory\n");
+
+  const directoryResult = runCli(directoryRoot, "init");
+  assert.equal(directoryResult.status, 1);
+  assert.match(directoryResult.stderr, /Canonical source path is not a directory/);
+  assert.equal(readFileSync(join(directoryRoot, ".agents"), "utf8"), "not a directory\n");
+
+  const fileRoot = temporaryDirectory(t);
+  mkdirSync(join(fileRoot, ".agents", "guide.md"), { recursive: true });
+
+  const fileResult = runCli(fileRoot, "init");
+  assert.equal(fileResult.status, 1);
+  assert.match(fileResult.stderr, /Canonical source is not a regular file/);
+  assert.equal(lstatSync(join(fileRoot, ".agents", "guide.md")).isDirectory(), true);
+
+  const configRoot = temporaryDirectory(t);
+  mkdirSync(join(configRoot, ".agents", "config.yaml"), { recursive: true });
+  const configResult = runCli(configRoot, "init");
+  assert.equal(configResult.status, 1);
+  assert.match(configResult.stderr, /Canonical source is not a regular file/);
+  assert.equal(lstatIfExists(join(configRoot, ".agents", "guide.md")), null);
+});
+
+test("generates deterministic repository-wide guidance for every supported agent", (t) => {
+  const root = temporaryRepo(t);
+
+  const initialCheck = runCli(root, "check");
+  assert.equal(initialCheck.status, 1);
+  for (const relativePath of generatedPaths) {
+    assert.match(initialCheck.stderr, new RegExp(`missing: ${relativePath.replaceAll(".", "\\.")}`));
+  }
+  assert.deepEqual(listFiles(root), [".agents/config.yaml", ".agents/guide.md"]);
+
+  const sync = runCli(root, "sync");
+  assert.equal(sync.status, 0, sync.stderr);
+  assert.match(sync.stdout, /Synced agent guidance/);
+
+  for (const relativePath of generatedPaths) {
+    assert.equal(read(root, relativePath), read(expectedRoot, relativePath));
+  }
+  assert.deepEqual(
+    listFiles(root).filter((path) => !path.startsWith(".agents/")),
+    [...generatedPaths].sort(),
+  );
+  assert.equal(listFiles(root).some((path) => path.endsWith(".tmp")), false);
+
+  const check = runCli(root, "check");
+  assert.equal(check.status, 0, check.stderr);
+  assert.match(check.stdout, /Agent guidance is in sync/);
+
+  const secondSync = runCli(root, "sync");
+  assert.equal(secondSync.status, 0, secondSync.stderr);
+  assert.match(secondSync.stdout, /already in sync/);
+});
+
+test("generates deterministic always and path-activated rule adapters", (t) => {
+  const root = temporaryDirectory(t);
+  cpSync(join(scopedFixtureRoot, ".agents"), join(root, ".agents"), { recursive: true });
+  const scopedGeneratedPaths = listFiles(scopedExpectedRoot);
+
+  const initialCheck = runCli(root, "check");
+  assert.equal(initialCheck.status, 1);
+  for (const relativePath of scopedGeneratedPaths) {
+    assert.match(initialCheck.stderr, new RegExp(`missing: ${relativePath.replaceAll(".", "\\.")}`));
+  }
+
+  const sync = runCli(root, "sync");
+  assert.equal(sync.status, 0, sync.stderr);
+  for (const relativePath of scopedGeneratedPaths) {
+    assert.equal(read(root, relativePath), read(scopedExpectedRoot, relativePath));
+  }
+  assert.equal(runCli(root, "check").status, 0);
+  assert.match(read(root, "AGENTS.md"), /agent-guidance-sync:rule source="\.agents\/rules\/quality\.md"/);
+  assert.doesNotMatch(read(root, "AGENTS.md"), /React Components/);
+});
+
+test("ignores auxiliary regular files in the canonical rules tree", (t) => {
+  const root = temporaryDirectory(t);
+  cpSync(join(scopedFixtureRoot, ".agents"), join(root, ".agents"), { recursive: true });
+  write(root, ".agents/rules/.DS_Store", "finder metadata\n");
+  write(root, ".agents/rules/.gitkeep", "");
+  write(root, ".agents/rules/README.md", "# Rule authoring notes\n");
+  write(root, ".agents/rules/frontend/react.md.swp", "editor state\n");
+  write(root, ".agents/rules/.obsidian/workspace.md", "editor state\n");
+
+  const sync = runCli(root, "sync");
+  assert.equal(sync.status, 0, sync.stderr);
+  assert.equal(runCli(root, "check").status, 0);
+  for (const relativePath of listFiles(scopedExpectedRoot)) {
+    assert.equal(read(root, relativePath), read(scopedExpectedRoot, relativePath));
+  }
+});
+
+test("rejects rule-looking Markdown files whose names are not lowercase kebab-case", (t) => {
+  for (const name of ["API-Rules.md", "api-rules.MD", "README.MD"]) {
+    const root = temporaryRepo(t);
+    write(root, `.agents/rules/${name}`, "# Misnamed guidance\n");
+
+    const check = runCli(root, "check");
+    assert.equal(check.status, 1);
+    assert.match(check.stderr, /Canonical rule paths must use lowercase kebab-case/);
+    assert.equal(lstatIfExists(join(root, "AGENTS.md")), null);
+  }
+});
+
+test("requires a scoped adapter when canonical guidance contains path rules", (t) => {
+  const root = temporaryDirectory(t);
+  cpSync(join(scopedFixtureRoot, ".agents"), join(root, ".agents"), { recursive: true });
+  writeFileSync(
+    join(root, ".agents", "config.yaml"),
+    `version: 1
+adapters:
+  agents: true
+  claude: true
+  cursor: false
+  copilot: false
+`,
+  );
+
+  const check = runCli(root, "check");
+  assert.equal(check.status, 1);
+  assert.match(
+    check.stderr,
+    /Path-activated rules require the Cursor or GitHub Copilot adapter/,
+  );
+  assert.equal(lstatIfExists(join(root, "AGENTS.md")), null);
+});
+
+test("strips a leading UTF-8 BOM from every canonical input", (t) => {
+  const root = temporaryDirectory(t);
+  cpSync(join(scopedFixtureRoot, ".agents"), join(root, ".agents"), { recursive: true });
+  for (const relativePath of [
+    ".agents/guide.md",
+    ".agents/config.yaml",
+    ".agents/rules/quality.md",
+    ".agents/rules/frontend/react.md",
+  ]) {
+    writeFileSync(join(root, relativePath), `\uFEFF${read(root, relativePath)}`);
+  }
+
+  const sync = runCli(root, "sync");
+  assert.equal(sync.status, 0, sync.stderr);
+  assert.equal(runCli(root, "check").status, 0);
+  for (const relativePath of listFiles(scopedExpectedRoot)) {
+    const contents = read(root, relativePath);
+    assert.equal(contents.includes("\uFEFF"), false, relativePath);
+    assert.equal(contents, read(scopedExpectedRoot, relativePath));
+  }
+});
+
+test("rendered targets expose only their consumed public fields", () => {
+  const [target] = renderTargets("# Guide\n");
+  assert.deepEqual(Object.keys(target).sort(), [
+    "contents",
+    "relativePath",
+    "unmanagedContents",
+  ]);
+});
+
+test("removes obsolete owned scoped outputs and preserves neighboring files", (t) => {
+  const root = temporaryDirectory(t);
+  cpSync(join(scopedFixtureRoot, ".agents"), join(root, ".agents"), { recursive: true });
+  write(root, ".cursor/rules/personal.mdc", "# Personal Cursor guidance\n");
+  write(root, ".github/instructions/personal.instructions.md", "# Personal Copilot guidance\n");
+  assert.equal(runCli(root, "sync").status, 0);
+
+  rmSync(join(root, ".agents", "rules", "frontend", "react.md"));
+  const check = runCli(root, "check");
+  assert.equal(check.status, 1);
+  assert.match(check.stderr, /obsolete: \.cursor\/rules\/agent-guidance\/frontend\/react\.mdc/);
+  assert.match(
+    check.stderr,
+    /obsolete: \.github\/instructions\/agent-guidance\/frontend\/react\.instructions\.md/,
+  );
+
+  const sync = runCli(root, "sync");
+  assert.equal(sync.status, 0, sync.stderr);
+  assert.equal(lstatIfExists(join(root, ".cursor/rules/agent-guidance/frontend/react.mdc")), null);
+  assert.equal(
+    lstatIfExists(
+      join(root, ".github/instructions/agent-guidance/frontend/react.instructions.md"),
+    ),
+    null,
+  );
+  assert.equal(lstatIfExists(join(root, ".cursor/rules/agent-guidance")), null);
+  assert.equal(lstatIfExists(join(root, ".github/instructions/agent-guidance")), null);
+  assert.equal(read(root, ".cursor/rules/personal.mdc"), "# Personal Cursor guidance\n");
+  assert.equal(
+    read(root, ".github/instructions/personal.instructions.md"),
+    "# Personal Copilot guidance\n",
+  );
+  assert.equal(runCli(root, "check").status, 0);
+});
+
+test("does not remove a symlink substituted for an obsolete scoped output", (t) => {
+  const root = temporaryDirectory(t);
+  cpSync(join(scopedFixtureRoot, ".agents"), join(root, ".agents"), { recursive: true });
+  assert.equal(runCli(root, "sync").status, 0);
+  const staleCursorPath = join(root, ".cursor/rules/agent-guidance/frontend/react.mdc");
+  const outside = join(temporaryDirectory(t, "agent-guidance-obsolete-outside-"), "rule.mdc");
+  writeFileSync(outside, "outside\n");
+  rmSync(join(root, ".agents", "rules", "frontend", "react.md"));
+  rmSync(staleCursorPath);
+  if (!createSymlinkOrSkip(t, outside, staleCursorPath, "file")) return;
+
+  const sync = runCli(root, "sync", "--force");
+  assert.equal(sync.status, 1);
+  assert.match(sync.stderr, /unsafe: \.cursor\/rules\/agent-guidance\/frontend\/react\.mdc/);
+  assert.equal(lstatSync(staleCursorPath).isSymbolicLink(), true);
+  assert.equal(readFileSync(outside, "utf8"), "outside\n");
+  assert.ok(
+    lstatIfExists(
+      join(root, ".github/instructions/agent-guidance/frontend/react.instructions.md"),
+    ),
+  );
+});
+
+test("stale-output discovery never traverses parent directory symlinks", (t) => {
+  const cursorRoot = temporaryRepo(t);
+  writeFileSync(
+    join(cursorRoot, ".agents", "config.yaml"),
+    `version: 1
+adapters:
+  agents: true
+  claude: true
+  cursor: true
+  copilot: true
+`,
+  );
+  const outsideCursor = temporaryDirectory(t, "agent-guidance-disabled-cursor-outside-");
+  write(outsideCursor, "rules/agent-guidance.mdc", read(expectedRoot, ".cursor/rules/agent-guidance.mdc"));
+  if (!createSymlinkOrSkip(t, outsideCursor, join(cursorRoot, ".cursor"), "dir")) return;
+
+  const cursorSync = runCli(cursorRoot, "sync", "--force");
+  assert.equal(cursorSync.status, 1);
+  assert.match(cursorSync.stderr, /generated path traverses a symlink: \.cursor/);
+  assert.equal(lstatIfExists(join(cursorRoot, "AGENTS.md")), null);
+  assert.equal(
+    read(outsideCursor, "rules/agent-guidance.mdc"),
+    read(expectedRoot, ".cursor/rules/agent-guidance.mdc"),
+  );
+
+  const namespaceRoot = temporaryRepo(t);
+  const outsideInstructions = temporaryDirectory(
+    t,
+    "agent-guidance-copilot-namespace-outside-",
+  );
+  const stalePath = "agent-guidance/stale.instructions.md";
+  write(
+    outsideInstructions,
+    stalePath,
+    '<!-- agent-guidance-sync:generated:v1 source=".agents/rules/stale.md" target=".github/instructions/agent-guidance/stale.instructions.md" -->\n',
+  );
+  mkdirSync(join(namespaceRoot, ".github"));
+  if (
+    !createSymlinkOrSkip(
+      t,
+      outsideInstructions,
+      join(namespaceRoot, ".github", "instructions"),
+      "dir",
+    )
+  ) {
+    return;
+  }
+
+  const namespaceSync = runCli(namespaceRoot, "sync", "--force");
+  assert.equal(namespaceSync.status, 1);
+  assert.match(namespaceSync.stderr, /generated path traverses a symlink: \.github\/instructions/);
+  assert.equal(lstatIfExists(join(namespaceRoot, "AGENTS.md")), null);
+  assert.match(read(outsideInstructions, stalePath), /source="\.agents\/rules\/stale\.md"/);
+});
+
+test(
+  "traverses reserved generated namespaces through verified directories",
+  { skip: process.platform === "win32" },
+  (t) => {
+    const root = temporaryDirectory(t);
+    cpSync(join(scopedFixtureRoot, ".agents"), join(root, ".agents"), { recursive: true });
+    assert.equal(runCli(root, "sync").status, 0);
+    const originalAgents = read(root, "AGENTS.md");
+    writeFileSync(join(root, ".agents", "guide.md"), "# Updated guidance\n");
+
+    const namespacePath = join(root, ".cursor", "rules", "agent-guidance");
+    const movedNamespacePath = join(root, ".cursor", "rules", "agent-guidance-original");
+    const outside = temporaryDirectory(t, "agent-guidance-namespace-race-outside-");
+    writeFileSync(join(outside, "rogue.mdc"), "# External unmanaged rule\n");
+    const originalFiles = snapshotFiles(namespacePath);
+    const outsideFiles = snapshotFiles(outside);
+
+    const script = `
+import fs from "node:fs";
+import { syncBuiltinESMExports } from "node:module";
+
+const root = ${JSON.stringify(root)};
+const namespacePath = ${JSON.stringify(namespacePath)};
+const movedNamespacePath = ${JSON.stringify(movedNamespacePath)};
+const outside = ${JSON.stringify(outside)};
+const originalChdir = process.chdir;
+const originalReaddirSync = fs.readdirSync;
+let externalAccess = false;
+let insideNamespace = false;
+let swapped = false;
+process.chdir = (path) => {
+  const result = originalChdir(path);
+  if (path === namespacePath) insideNamespace = true;
+  return result;
+};
+fs.readdirSync = (path, options) => {
+  if (!swapped && (path === namespacePath || (insideNamespace && path === "."))) {
+    fs.renameSync(namespacePath, movedNamespacePath);
+    fs.symlinkSync(outside, namespacePath, "dir");
+    swapped = true;
+  }
+  const entries = originalReaddirSync(path, options);
+  if (swapped && entries.some((entry) => entry === "rogue.mdc" || entry?.name === "rogue.mdc")) {
+    externalAccess = true;
+  }
+  return entries;
+};
+syncBuiltinESMExports();
+
+const { syncProject } = await import(${JSON.stringify(pathToFileURL(join(packageRoot, "src", "index.mjs")).href)});
+let failure = null;
+try {
+  syncProject(root);
+} catch (error) {
+  failure = error;
+}
+if (!swapped) throw new Error("The reserved-namespace substitution was not injected.");
+if (externalAccess) throw new Error("Synchronization traversed the replacement namespace.");
+if (!failure) throw new Error("Synchronization accepted a replacement reserved namespace.");
+const failureMessages = [];
+for (let current = failure; current; current = current.cause) failureMessages.push(current.message);
+if (!failureMessages.some((message) => /Managed output directory changed/.test(message))) {
+  throw failure;
+}
+`;
+    const result = spawnSync(process.execPath, ["--input-type=module", "--eval", script], {
+      encoding: "utf8",
+    });
+
+    assert.equal(result.status, 0, result.stderr);
+    assert.deepEqual(snapshotFiles(movedNamespacePath), originalFiles);
+    assert.deepEqual(snapshotFiles(outside), outsideFiles);
+    assert.equal(lstatSync(namespacePath).isSymbolicLink(), true);
+    assert.equal(read(root, "AGENTS.md"), originalAgents);
+    assert.equal(listFiles(root).some((path) => path.endsWith(".tmp")), false);
+  },
+);
+
+test("disabled adapters ignore unrelated symlinked vendor trees", (t) => {
+  const scenarios = [
+    {
+      config: `version: 1
+adapters:
+  agents: true
+  claude: true
+  cursor: false
+  copilot: true
+`,
+      disabledPath: ".cursor",
+      enabledPath: ".github/copilot-instructions.md",
+      name: "cursor",
+    },
+    {
+      config: `version: 1
+adapters:
+  agents: true
+  claude: true
+  cursor: true
+  copilot: false
+`,
+      disabledPath: ".github",
+      enabledPath: ".cursor/rules/agent-guidance.mdc",
+      name: "copilot",
+    },
+  ];
+
+  for (const scenario of scenarios) {
+    const root = temporaryRepo(t);
+    const outside = temporaryDirectory(t, `agent-guidance-disabled-${scenario.name}-outside-`);
+    writeFileSync(join(outside, "sentinel"), "outside\n");
+    if (!createSymlinkOrSkip(t, outside, join(root, scenario.disabledPath), "dir")) return;
+    writeFileSync(join(root, ".agents", "config.yaml"), scenario.config);
+
+    const sync = runCli(root, "sync");
+    assert.equal(sync.status, 0, sync.stderr);
+    assert.equal(lstatSync(join(root, scenario.disabledPath)).isSymbolicLink(), true);
+    assert.equal(readFileSync(join(outside, "sentinel"), "utf8"), "outside\n");
+    assert.ok(lstatIfExists(join(root, "AGENTS.md")));
+    assert.ok(lstatIfExists(join(root, "CLAUDE.md")));
+    assert.ok(lstatIfExists(join(root, scenario.enabledPath)));
+    assert.equal(runCli(root, "check").status, 0);
+  }
+});
+
+test("obsolete ownership requires an exact version and source-to-target mapping", (t) => {
+  const root = temporaryRepo(t);
+  writeFileSync(
+    join(root, ".agents", "config.yaml"),
+    `version: 1
+adapters:
+  agents: false
+  claude: false
+  cursor: false
+  copilot: false
+`,
+  );
+  write(
+    root,
+    "AGENTS.md",
+    '<!-- agent-guidance-sync:generated:v1 source=".agents/rules/not-agents.md" target="AGENTS.md" -->\n',
+  );
+  const wrongSourcePath = ".cursor/rules/agent-guidance/wrong-source.mdc";
+  write(
+    root,
+    wrongSourcePath,
+    `---
+description: "Wrong source"
+globs: ["**/*.md"]
+alwaysApply: false
+---
+
+<!-- agent-guidance-sync:generated:v1 source=".agents/guide.md" target="${wrongSourcePath}" -->
+`,
+  );
+  const wrongVersionPath = ".cursor/rules/agent-guidance/wrong-version.mdc";
+  write(
+    root,
+    wrongVersionPath,
+    `---
+description: "Wrong version"
+globs: ["**/*.md"]
+alwaysApply: false
+---
+
+<!-- agent-guidance-sync:generated:v01 source=".agents/rules/wrong-version.md" target="${wrongVersionPath}" -->
+`,
+  );
+
+  const check = runCli(root, "check");
+  assert.equal(check.status, 1);
+  assert.match(check.stderr, /unmanaged: \.cursor\/rules\/agent-guidance\/wrong-source\.mdc/);
+  assert.match(check.stderr, /unmanaged: \.cursor\/rules\/agent-guidance\/wrong-version\.mdc/);
+  assert.doesNotMatch(check.stderr, /obsolete/);
+
+  const sync = runCli(root, "sync", "--force");
+  assert.equal(sync.status, 1);
+  assert.ok(lstatIfExists(join(root, "AGENTS.md")));
+  assert.ok(lstatIfExists(join(root, wrongSourcePath)));
+  assert.ok(lstatIfExists(join(root, wrongVersionPath)));
+});
+
+test("blocks all writes for unmanaged files inside reserved generated namespaces", (t) => {
+  const root = temporaryDirectory(t);
+  cpSync(join(scopedFixtureRoot, ".agents"), join(root, ".agents"), { recursive: true });
+  assert.equal(runCli(root, "sync").status, 0);
+  const originalAgents = read(root, "AGENTS.md");
+  const roguePath = ".cursor/rules/agent-guidance/rogue.mdc";
+  write(root, roguePath, "# Unmanaged reserved file\n");
+  writeFileSync(join(root, ".agents", "guide.md"), "# Updated guide\n");
+
+  for (const command of [["sync"], ["sync", "--force"]]) {
+    const result = runCli(root, ...command);
+    assert.equal(result.status, 1);
+    assert.match(result.stderr, /unmanaged: \.cursor\/rules\/agent-guidance\/rogue\.mdc/);
+    assert.match(result.stderr, /move or remove it explicitly/);
+    assert.equal(read(root, roguePath), "# Unmanaged reserved file\n");
+    assert.equal(read(root, "AGENTS.md"), originalAgents);
+  }
+});
+
+test("recovers exact owned temporary files left in reserved generated namespaces", (t) => {
+  const takeoverModes = [[], ["--adopt"], ["--force"]];
+  for (const takeover of takeoverModes) {
+    const root = temporaryDirectory(t);
+    cpSync(join(scopedFixtureRoot, ".agents"), join(root, ".agents"), { recursive: true });
+    assert.equal(runCli(root, "sync").status, 0);
+    const targetPath = ".cursor/rules/agent-guidance/frontend/react.mdc";
+    const temporaryPath =
+      ".cursor/rules/agent-guidance/frontend/.react.mdc.123.00000000-0000-4000-8000-000000000000.tmp";
+    write(root, temporaryPath, read(root, targetPath));
+
+    const check = runCli(root, "check");
+    assert.equal(check.status, 1);
+    assert.match(
+      check.stderr,
+      /obsolete: \.cursor\/rules\/agent-guidance\/frontend\/\.react\.mdc\.123\./,
+    );
+
+    const sync = runCli(root, "sync", ...takeover);
+    assert.equal(sync.status, 0, sync.stderr);
+    assert.equal(lstatIfExists(join(root, temporaryPath)), null);
+    assert.equal(runCli(root, "check").status, 0);
+  }
+});
+
+test("does not claim temp-shaped files without an exact ownership marker", (t) => {
+  const root = temporaryDirectory(t);
+  cpSync(join(scopedFixtureRoot, ".agents"), join(root, ".agents"), { recursive: true });
+  assert.equal(runCli(root, "sync").status, 0);
+  const temporaryPath =
+    ".cursor/rules/agent-guidance/frontend/.react.mdc.123.00000000-0000-4000-8000-000000000000.tmp";
+  write(root, temporaryPath, "# Unmanaged temporary-looking file\n");
+
+  const sync = runCli(root, "sync", "--force");
+  assert.equal(sync.status, 1);
+  assert.match(sync.stderr, /unmanaged: \.cursor\/rules\/agent-guidance\/frontend\/\.react\.mdc/);
+  assert.equal(read(root, temporaryPath), "# Unmanaged temporary-looking file\n");
+});
+
+test("disabled adapters remove only their exactly owned outputs", (t) => {
+  const root = temporaryDirectory(t);
+  cpSync(join(scopedFixtureRoot, ".agents"), join(root, ".agents"), { recursive: true });
+  write(root, ".cursor/rules/personal.mdc", "# Personal Cursor guidance\n");
+  write(root, ".github/instructions/personal.instructions.md", "# Personal Copilot guidance\n");
+  assert.equal(runCli(root, "sync").status, 0);
+  rmSync(join(root, ".agents", "rules", "frontend", "react.md"));
+
+  writeFileSync(
+    join(root, ".agents", "config.yaml"),
+    `version: 1
+adapters:
+  agents: true
+  claude: true
+  cursor: false
+  copilot: false
+`,
+  );
+  const check = runCli(root, "check");
+  assert.equal(check.status, 1);
+  assert.match(check.stderr, /obsolete: \.cursor\/rules\/agent-guidance\.mdc/);
+  assert.match(check.stderr, /obsolete: \.github\/copilot-instructions\.md/);
+
+  const sync = runCli(root, "sync");
+  assert.equal(sync.status, 0, sync.stderr);
+  assert.ok(lstatIfExists(join(root, "AGENTS.md")));
+  assert.ok(lstatIfExists(join(root, "CLAUDE.md")));
+  assert.equal(lstatIfExists(join(root, ".cursor/rules/agent-guidance.mdc")), null);
+  assert.equal(lstatIfExists(join(root, ".cursor/rules/agent-guidance/frontend/react.mdc")), null);
+  assert.equal(lstatIfExists(join(root, ".github/copilot-instructions.md")), null);
+  assert.equal(
+    lstatIfExists(
+      join(root, ".github/instructions/agent-guidance/frontend/react.instructions.md"),
+    ),
+    null,
+  );
+  assert.equal(lstatIfExists(join(root, ".cursor/rules/agent-guidance")), null);
+  assert.equal(lstatIfExists(join(root, ".github/instructions/agent-guidance")), null);
+  assert.equal(read(root, ".cursor/rules/personal.mdc"), "# Personal Cursor guidance\n");
+  assert.equal(
+    read(root, ".github/instructions/personal.instructions.md"),
+    "# Personal Copilot guidance\n",
+  );
+  assert.equal(runCli(root, "check").status, 0);
+});
+
+test("rejects invalid config and rule schemas before generating files", (t) => {
+  const missingConfigRoot = temporaryRepo(t);
+  rmSync(join(missingConfigRoot, ".agents", "config.yaml"));
+  const missingConfig = runCli(missingConfigRoot, "check");
+  assert.equal(missingConfig.status, 1);
+  assert.match(missingConfig.stderr, /Missing canonical config/);
+  assert.match(missingConfig.stderr, /agent-guidance init/);
+  assert.equal(lstatIfExists(join(missingConfigRoot, "AGENTS.md")), null);
+
+  const invalidConfigs = [
+    ["version: 2\n", /needs version: 1/],
+    ["version: 01\n", /needs version: 1/],
+    [
+      `adapters:
+  agents: true
+version: 1
+  claude: true
+  cursor: true
+  copilot: true
+`,
+      /Invalid \.agents\/config\.yaml line/,
+    ],
+    [
+      `version: 1
+adapters:
+  agents: false
+  claude: true
+  cursor: true
+  copilot: true
+`,
+      /Claude adapter requires the AGENTS\.md adapter/,
+    ],
+  ];
+  for (const [contents, expectedError] of invalidConfigs) {
+    const root = temporaryRepo(t);
+    writeFileSync(join(root, ".agents", "config.yaml"), contents);
+    const check = runCli(root, "check");
+    assert.equal(check.status, 1);
+    assert.match(check.stderr, expectedError);
+    assert.deepEqual(
+      listFiles(root).filter((path) => !path.startsWith(".agents/")),
+      [],
+    );
+  }
+
+  const invalidRules = [
+    [
+      "bad-activation.md",
+      `---
+description: Invalid activation
+activation: sometimes
+---
+# Invalid
+`,
+      /needs activation: always\|path/,
+    ],
+    [
+      "missing-paths.md",
+      `---
+description: Missing paths
+activation: path
+---
+# Missing Paths
+`,
+      /needs at least one path/,
+    ],
+    [
+      "unsafe-path.md",
+      `---
+description: Unsafe path
+activation: path
+paths:
+  - "../outside/**"
+---
+# Unsafe Path
+`,
+      /unsafe or non-portable path glob/,
+    ],
+    [
+      "invalid-quote.md",
+      `---
+description: 'Broken' trailing'
+activation: always
+---
+# Invalid Quote
+`,
+      /invalid quoted string/,
+    ],
+    [
+      "always-paths.md",
+      `---
+description: Always with paths
+activation: always
+paths:
+---
+# Always Paths
+`,
+      /must not declare paths/,
+    ],
+    [
+      "indented-heading.md",
+      `---
+description: Indented code heading
+activation: always
+---
+    # Not a heading
+`,
+      /needs a level-one heading/,
+    ],
+    [
+      "control-path.md",
+      `---
+description: Control path
+activation: path
+paths:
+  - apps/\u0007/**
+---
+# Control Path
+`,
+      /unsafe or non-portable path glob/,
+    ],
+    [
+      "inline-comment.md",
+      `---
+description: Inline comment
+activation: path
+paths:
+  - apps/**/*.tsx # frontend
+---
+# Inline Comment
+`,
+      /unsupported plain-scalar YAML syntax/,
+    ],
+    [
+      "windows-path.md",
+      `---
+description: Windows-invalid paths
+activation: path
+paths:
+  - "apps/feature:legacy/**"
+---
+# Windows-invalid Paths
+`,
+      /unsafe or non-portable path glob/,
+    ],
+    [
+      "trailing-dot-path.md",
+      `---
+description: Trailing dot path
+activation: path
+paths:
+  - "apps/legacy./**"
+---
+# Trailing Dot Path
+`,
+      /unsafe or non-portable path glob/,
+    ],
+    [
+      "yaml-flow-collection.md",
+      `---
+description: [Shared, testing]
+activation: always
+---
+# YAML Flow Collection
+`,
+      /unsupported plain-scalar YAML syntax/,
+    ],
+    [
+      "yaml-anchor.md",
+      `---
+description: &shared Shared
+activation: always
+---
+# YAML Anchor
+`,
+      /unsupported plain-scalar YAML syntax/,
+    ],
+    [
+      "yaml-colon.md",
+      `---
+description: Shared:
+activation: always
+---
+# YAML Colon
+`,
+      /unsupported plain-scalar YAML syntax/,
+    ],
+    [
+      "yaml-nested-sequence.md",
+      `---
+description: Nested sequence
+activation: path
+paths:
+  - - apps/**
+---
+# YAML Nested Sequence
+`,
+      /unsupported plain-scalar YAML syntax/,
+    ],
+    [
+      "windows-device-path.md",
+      `---
+description: Windows device path
+activation: path
+paths:
+  - "packages/NUL.txt/**"
+---
+# Windows Device Path
+`,
+      /unsafe or non-portable path glob/,
+    ],
+  ];
+  for (const [fileName, contents, expectedError] of invalidRules) {
+    const root = temporaryRepo(t);
+    write(root, `.agents/rules/${fileName}`, contents);
+    const check = runCli(root, "check");
+    assert.equal(check.status, 1);
+    assert.match(check.stderr, expectedError);
+    if (contents.includes("\u0007")) {
+      assert.equal(check.stderr.includes("\u0007"), false);
+      assert.match(check.stderr, /\\u0007/);
+    }
+    assert.equal(lstatIfExists(join(root, "AGENTS.md")), null);
+  }
+});
+
+test("escapes untrusted filesystem names before writing terminal diagnostics", (t) => {
+  if (process.platform === "win32") {
+    t.skip("Windows does not support the control-character fixture name.");
+    return;
+  }
+
+  const root = temporaryRepo(t);
+  const unsafeName = "\u001b[31mspoof\nnext\u2028split\u202ereordered\u{1d173}.mdc";
+  write(root, `.cursor/rules/agent-guidance/${unsafeName}`, "# Unmanaged\n");
+
+  const check = runCli(root, "check");
+  assert.equal(check.status, 1);
+  assert.equal(check.stderr.includes("\u001b"), false);
+  assert.equal(check.stderr.includes("\nnext"), false);
+  assert.equal(check.stderr.includes("\u2028"), false);
+  assert.equal(check.stderr.includes("\u202e"), false);
+  assert.equal(check.stderr.includes("\u{1d173}"), false);
+  assert.match(
+    check.stderr,
+    /\\u001b\[31mspoof\\nnext\\u2028split\\u202ereordered\\ud834\\udd73\.mdc/,
+  );
+
+  const jsonCheck = runCli(root, "check", "--json");
+  assert.equal(jsonCheck.status, 1);
+  assert.equal(jsonCheck.stderr, "");
+  assert.equal(jsonCheck.stdout.includes("\u001b"), false);
+  assert.equal(jsonCheck.stdout.includes("\u2028"), false);
+  assert.equal(jsonCheck.stdout.includes("\u202e"), false);
+  assert.equal(jsonCheck.stdout.includes("\u{1d173}"), false);
+  const jsonResult = JSON.parse(jsonCheck.stdout);
+  assert.ok(
+    jsonResult.plan.some(
+      ({ path }) => path === `.cursor/rules/agent-guidance/${unsafeName}`,
+    ),
+  );
+});
+
+test("rejects symlinked config and rule sources without following them", (t) => {
+  const outsideRoot = temporaryDirectory(t, "agent-guidance-canonical-outside-");
+  const outsideConfig = join(outsideRoot, "config.yaml");
+  writeFileSync(outsideConfig, INITIAL_CONFIG);
+
+  const configRoot = temporaryRepo(t);
+  rmSync(join(configRoot, ".agents", "config.yaml"));
+  if (!createSymlinkOrSkip(t, outsideConfig, join(configRoot, ".agents", "config.yaml"), "file")) {
+    return;
+  }
+  const configCheck = runCli(configRoot, "check");
+  assert.equal(configCheck.status, 1);
+  assert.match(configCheck.stderr, /Canonical config must not be a symlink/);
+  assert.equal(lstatIfExists(join(configRoot, "AGENTS.md")), null);
+
+  const rulesRoot = temporaryRepo(t);
+  const outsideRules = join(outsideRoot, "rules");
+  mkdirSync(outsideRules);
+  writeFileSync(join(outsideRules, "outside.md"), "outside\n");
+  if (!createSymlinkOrSkip(t, outsideRules, join(rulesRoot, ".agents", "rules"), "dir")) return;
+  const rulesCheck = runCli(rulesRoot, "check");
+  assert.equal(rulesCheck.status, 1);
+  assert.match(rulesCheck.stderr, /Canonical rules directory must not be a symlink/);
+  assert.equal(readFileSync(join(outsideRules, "outside.md"), "utf8"), "outside\n");
+  assert.equal(lstatIfExists(join(rulesRoot, "AGENTS.md")), null);
+});
+
+test(
+  "reads canonical children through the verified source directory",
+  { skip: process.platform === "win32" },
+  (t) => {
+    const root = temporaryDirectory(t);
+    const agentsPath = join(root, ".agents");
+    const movedAgentsPath = join(root, ".agents-original");
+    const outside = temporaryDirectory(t, "agent-guidance-canonical-parent-outside-");
+    cpSync(join(scopedFixtureRoot, ".agents"), agentsPath, { recursive: true });
+    cpSync(join(scopedFixtureRoot, ".agents"), outside, { recursive: true });
+    writeFileSync(join(outside, "guide.md"), "# Outside guidance\n");
+    writeFileSync(join(outside, "rules", "outside.md"), "# Outside rule\n");
+    const originalFiles = snapshotFiles(agentsPath);
+    const outsideFiles = snapshotFiles(outside);
+
+    const script = `
+import fs from "node:fs";
+import { syncBuiltinESMExports } from "node:module";
+
+const root = ${JSON.stringify(root)};
+const agentsPath = ${JSON.stringify(agentsPath)};
+const movedAgentsPath = ${JSON.stringify(movedAgentsPath)};
+const outside = ${JSON.stringify(outside)};
+const originalChdir = process.chdir;
+const originalOpenSync = fs.openSync;
+const originalReaddirSync = fs.readdirSync;
+let externalAccess = false;
+let swapped = false;
+process.chdir = (path) => {
+  const result = originalChdir(path);
+  if (!swapped && path === agentsPath) {
+    fs.renameSync(agentsPath, movedAgentsPath);
+    fs.symlinkSync(outside, agentsPath, "dir");
+    swapped = true;
+  }
+  return result;
+};
+fs.openSync = (path, flags, mode) => {
+  if (swapped && typeof path === "string" && path.startsWith(agentsPath + "/")) {
+    externalAccess = true;
+  }
+  return originalOpenSync(path, flags, mode);
+};
+fs.readdirSync = (path, options) => {
+  if (swapped && typeof path === "string" && path.startsWith(agentsPath + "/")) {
+    externalAccess = true;
+  }
+  return originalReaddirSync(path, options);
+};
+syncBuiltinESMExports();
+
+const { syncProject } = await import(${JSON.stringify(pathToFileURL(join(packageRoot, "src", "index.mjs")).href)});
+let failure = null;
+try {
+  syncProject(root);
+} catch (error) {
+  failure = error;
+}
+if (!swapped) throw new Error("The canonical source-directory substitution was not injected.");
+if (externalAccess) throw new Error("Synchronization accessed the replacement canonical source.");
+if (!failure) throw new Error("Synchronization accepted a replacement canonical source directory.");
+const failureMessages = [];
+for (let current = failure; current; current = current.cause) failureMessages.push(current.message);
+if (!failureMessages.some((message) => /Canonical source directory changed/.test(message))) {
+  throw failure;
+}
+`;
+    const result = spawnSync(process.execPath, ["--input-type=module", "--eval", script], {
+      encoding: "utf8",
+    });
+
+    assert.equal(result.status, 0, result.stderr);
+    assert.deepEqual(snapshotFiles(movedAgentsPath), originalFiles);
+    assert.deepEqual(snapshotFiles(outside), outsideFiles);
+    assert.equal(lstatSync(agentsPath).isSymbolicLink(), true);
+    for (const relativePath of generatedPaths) {
+      assert.equal(lstatIfExists(join(root, relativePath)), null);
+    }
+  },
+);
+
+test(
+  "traverses canonical rules through each verified directory",
+  { skip: process.platform === "win32" },
+  (t) => {
+    const root = temporaryDirectory(t);
+    cpSync(join(scopedFixtureRoot, ".agents"), join(root, ".agents"), { recursive: true });
+    const rulesPath = join(root, ".agents", "rules");
+    const movedRulesPath = join(root, ".agents", "rules-original");
+    const outside = temporaryDirectory(t, "agent-guidance-canonical-rules-outside-");
+    writeFileSync(join(outside, "outside.md"), "# Outside rule\n");
+    const originalFiles = snapshotFiles(rulesPath);
+    const outsideFiles = snapshotFiles(outside);
+
+    const script = `
+import fs from "node:fs";
+import { syncBuiltinESMExports } from "node:module";
+
+const root = ${JSON.stringify(root)};
+const rulesPath = ${JSON.stringify(rulesPath)};
+const movedRulesPath = ${JSON.stringify(movedRulesPath)};
+const outside = ${JSON.stringify(outside)};
+const originalReaddirSync = fs.readdirSync;
+let externalAccess = false;
+let swapped = false;
+fs.readdirSync = (path, options) => {
+  if (
+    !swapped &&
+    (path === rulesPath || path === ".")
+  ) {
+    fs.renameSync(rulesPath, movedRulesPath);
+    fs.symlinkSync(outside, rulesPath, "dir");
+    swapped = true;
+  }
+  const entries = originalReaddirSync(path, options);
+  if (swapped && entries.some((entry) => entry === "outside.md" || entry?.name === "outside.md")) {
+    externalAccess = true;
+  }
+  return entries;
+};
+syncBuiltinESMExports();
+
+const { syncProject } = await import(${JSON.stringify(pathToFileURL(join(packageRoot, "src", "index.mjs")).href)});
+let failure = null;
+try {
+  syncProject(root);
+} catch (error) {
+  failure = error;
+}
+if (!swapped) throw new Error("The canonical rules-directory substitution was not injected.");
+if (externalAccess) throw new Error("Synchronization traversed the replacement rules directory.");
+if (!failure) throw new Error("Synchronization accepted a replacement canonical rules directory.");
+const failureMessages = [];
+for (let current = failure; current; current = current.cause) failureMessages.push(current.message);
+if (!failureMessages.some((message) => /Canonical rules directory changed/.test(message))) {
+  throw failure;
+}
+`;
+    const result = spawnSync(process.execPath, ["--input-type=module", "--eval", script], {
+      encoding: "utf8",
+    });
+
+    assert.equal(result.status, 0, result.stderr);
+    assert.deepEqual(snapshotFiles(movedRulesPath), originalFiles);
+    assert.deepEqual(snapshotFiles(outside), outsideFiles);
+    assert.equal(lstatSync(rulesPath).isSymbolicLink(), true);
+    for (const relativePath of generatedPaths) {
+      assert.equal(lstatIfExists(join(root, relativePath)), null);
+    }
+  },
+);
+
+test("leaves unrelated files beside generated targets untouched", (t) => {
+  const root = temporaryRepo(t);
+  write(root, ".cursor/rules/personal.mdc", "# Personal Cursor rule\n");
+  write(root, ".github/notes.md", "# Repository notes\n");
+
+  const sync = runCli(root, "sync");
+  assert.equal(sync.status, 0, sync.stderr);
+  assert.equal(read(root, ".cursor/rules/personal.mdc"), "# Personal Cursor rule\n");
+  assert.equal(read(root, ".github/notes.md"), "# Repository notes\n");
+  assert.equal(runCli(root, "check").status, 0);
+});
+
+test("reports missing and stale files and repairs them with the same plan", (t) => {
+  const root = temporaryRepo(t);
+  assert.equal(runCli(root, "sync").status, 0);
+
+  rmSync(join(root, "CLAUDE.md"));
+  writeFileSync(join(root, "AGENTS.md"), `${read(root, "AGENTS.md")}\nmanual drift\n`);
+
+  const check = runCli(root, "check");
+  assert.equal(check.status, 1);
+  assert.match(check.stderr, /stale: AGENTS\.md/);
+  assert.match(check.stderr, /missing: CLAUDE\.md/);
+
+  const repair = runCli(root, "sync");
+  assert.equal(repair.status, 0, repair.stderr);
+  assert.match(repair.stdout, /stale: AGENTS\.md/);
+  assert.match(repair.stdout, /missing: CLAUDE\.md/);
+  assert.equal(read(root, "AGENTS.md"), read(expectedRoot, "AGENTS.md"));
+  assert.equal(read(root, "CLAUDE.md"), read(expectedRoot, "CLAUDE.md"));
+});
+
+test("dry-run plans creates, updates, and deletions without mutating files", (t) => {
+  const root = temporaryDirectory(t);
+  cpSync(join(scopedFixtureRoot, ".agents"), join(root, ".agents"), { recursive: true });
+  assert.equal(runCli(root, "sync").status, 0);
+
+  writeFileSync(join(root, ".agents", "guide.md"), "# Changed repository guidance\n");
+  rmSync(join(root, ".agents", "rules", "frontend", "react.md"));
+  const before = snapshotFiles(root);
+
+  const dryRun = runCli(root, "sync", "--dry-run");
+  assert.equal(dryRun.status, 0, dryRun.stderr);
+  assert.match(dryRun.stdout, /Dry run: agent guidance would be synced; no files were changed/);
+  assert.match(dryRun.stdout, /stale: AGENTS\.md/);
+  assert.match(
+    dryRun.stdout,
+    /obsolete: \.cursor\/rules\/agent-guidance\/frontend\/react\.mdc/,
+  );
+  assert.match(
+    dryRun.stdout,
+    /obsolete: \.github\/instructions\/agent-guidance\/frontend\/react\.instructions\.md/,
+  );
+  assert.deepEqual(snapshotFiles(root), before);
+  assert.equal(runCli(root, "check").status, 1);
+});
+
+test("dry-run honors takeover modes without claiming unmanaged files", (t) => {
+  const root = temporaryRepo(t);
+  write(root, "AGENTS.md", "# Existing unmanaged guidance\n");
+  const before = snapshotFiles(root);
+
+  const blocked = runCli(root, "sync", "--dry-run");
+  assert.equal(blocked.status, 1);
+  assert.match(blocked.stderr, /unmanaged: AGENTS\.md/);
+
+  const forced = runCli(root, "sync", "--force", "--dry-run");
+  assert.equal(forced.status, 0, forced.stderr);
+  assert.match(forced.stdout, /replace: AGENTS\.md/);
+  assert.deepEqual(snapshotFiles(root), before);
+});
+
+test("emits a stable JSON lifecycle without exposing plan internals", (t) => {
+  const root = temporaryDirectory(t);
+
+  const init = runCli(root, "init", "--json");
+  assert.equal(init.status, 0, init.stderr);
+  assert.equal(init.stderr, "");
+  assert.deepEqual(JSON.parse(init.stdout), {
+    schemaVersion: 1,
+    command: "init",
+    ok: true,
+    status: "initialized",
+    root: realpathSync(root),
+    createdPaths: [".agents/guide.md", ".agents/config.yaml"],
+    existingPaths: [],
+  });
+
+  const initialCheck = runCli(root, "check", "--json");
+  assert.equal(initialCheck.status, 1);
+  assert.equal(initialCheck.stderr, "");
+  const outOfSync = JSON.parse(initialCheck.stdout);
+  assert.equal(outOfSync.schemaVersion, 1);
+  assert.equal(outOfSync.command, "check");
+  assert.equal(outOfSync.ok, false);
+  assert.equal(outOfSync.status, "out-of-sync");
+  assert.deepEqual(
+    outOfSync.plan.map(({ action, path }) => [action, path]),
+    generatedPaths.map((path) => ["create", path]),
+  );
+  assert.deepEqual(Object.keys(outOfSync.plan[0]), ["action", "path"]);
+
+  const dryRun = runCli(root, "sync", "--dry-run", "--json");
+  assert.equal(dryRun.status, 0, dryRun.stderr);
+  const planned = JSON.parse(dryRun.stdout);
+  assert.equal(planned.status, "changes-planned");
+  assert.equal(planned.dryRun, true);
+  assert.equal(planned.takeover, "none");
+  assert.deepEqual(planned.plan, outOfSync.plan);
+  assert.equal(lstatIfExists(join(root, "AGENTS.md")), null);
+
+  const sync = runCli(root, "sync", "--json");
+  assert.equal(sync.status, 0, sync.stderr);
+  const synced = JSON.parse(sync.stdout);
+  assert.equal(synced.status, "synced");
+  assert.equal(synced.dryRun, false);
+  assert.equal(synced.plan.every(({ action }) => action === "create"), true);
+  assert.deepEqual(synced.plan, outOfSync.plan);
+
+  const finalCheck = runCli(root, "check", "--json");
+  assert.equal(finalCheck.status, 0, finalCheck.stderr);
+  const inSync = JSON.parse(finalCheck.stdout);
+  assert.equal(inSync.status, "in-sync");
+  assert.equal(inSync.plan.every(({ action }) => action === "unchanged"), true);
+
+  const unchangedSync = runCli(root, "sync", "--json");
+  assert.equal(unchangedSync.status, 0, unchangedSync.stderr);
+  assert.equal(JSON.parse(unchangedSync.stdout).status, "unchanged");
+
+  const secondInit = runCli(root, "init", "--json");
+  assert.equal(secondInit.status, 0, secondInit.stderr);
+  const unchangedInit = JSON.parse(secondInit.stdout);
+  assert.equal(unchangedInit.status, "unchanged");
+  assert.deepEqual(unchangedInit.createdPaths, []);
+  assert.deepEqual(unchangedInit.existingPaths, [".agents/guide.md", ".agents/config.yaml"]);
+});
+
+test("emits JSON blocked states and errors on their documented streams", (t) => {
+  const root = temporaryRepo(t);
+  write(root, "AGENTS.md", "# Existing unmanaged guidance\n");
+
+  const blocked = runCli(root, "sync", "--json");
+  assert.equal(blocked.status, 1);
+  assert.equal(blocked.stderr, "");
+  const blockedResult = JSON.parse(blocked.stdout);
+  assert.equal(blockedResult.ok, false);
+  assert.equal(blockedResult.status, "blocked");
+  assert.deepEqual(
+    blockedResult.plan.find(({ path }) => path === "AGENTS.md"),
+    {
+      action: "conflict",
+      path: "AGENTS.md",
+      reason: "unmanaged content differs; use --force to replace it",
+    },
+  );
+  assert.equal(lstatIfExists(join(root, "CLAUDE.md")), null);
+
+  const usage = runCli(root, "sync", "--adopt", "--force", "--json");
+  assert.equal(usage.status, 2);
+  assert.equal(usage.stdout, "");
+  assert.deepEqual(JSON.parse(usage.stderr), {
+    schemaVersion: 1,
+    command: "sync",
+    ok: false,
+    status: "error",
+    error: {
+      type: "usage",
+      message: "--adopt and --force are mutually exclusive.",
+    },
+  });
+
+  const missingRoot = temporaryDirectory(t);
+  const guidanceError = runCli(missingRoot, "check", "--json");
+  assert.equal(guidanceError.status, 1);
+  assert.equal(guidanceError.stdout, "");
+  const errorResult = JSON.parse(guidanceError.stderr);
+  assert.equal(errorResult.command, "check");
+  assert.equal(errorResult.error.type, "guidance");
+  assert.match(errorResult.error.message, /Could not find \.agents\/guide\.md/);
+});
+
+test("treats CRLF generated output as equivalent checkout text", (t) => {
+  const root = temporaryRepo(t);
+  assert.equal(runCli(root, "sync").status, 0);
+  const expected = read(root, "AGENTS.md");
+  const crlf = expected.replaceAll("\n", "\r\n");
+  writeFileSync(join(root, "AGENTS.md"), crlf);
+
+  const check = runCli(root, "check");
+  assert.equal(check.status, 0, check.stderr);
+  assert.match(check.stdout, /Agent guidance is in sync/);
+  const sync = runCli(root, "sync");
+  assert.equal(sync.status, 0, sync.stderr);
+  assert.match(sync.stdout, /already in sync/);
+  assert.equal(read(root, "AGENTS.md"), crlf);
+});
+
+test("normalizes CRLF canonical input and emits one trailing newline", (t) => {
+  const root = temporaryRepo(t);
+  const source = read(root, ".agents/guide.md").trimEnd().replaceAll("\n", "\r\n");
+  writeFileSync(join(root, ".agents", "guide.md"), `${source}\r\n\r\n`);
+
+  const sync = runCli(root, "sync");
+  assert.equal(sync.status, 0, sync.stderr);
+  for (const relativePath of generatedPaths) {
+    assert.equal(read(root, relativePath), read(expectedRoot, relativePath));
+  }
+});
+
+test("normalizes a large non-matching whitespace suffix in linear time", () => {
+  const guide = `# Performance fixture\n${"\n ".repeat(20_000)}x`;
+  const started = performance.now();
+  const targets = renderTargets(guide);
+  const elapsed = performance.now() - started;
+
+  assert.match(targets[0].contents, /\n x\n$/);
+  assert.ok(elapsed < 500, `Guide normalization took ${elapsed.toFixed(1)}ms`);
+});
+
+test("uses lossless bigint filesystem identities for every verified stat", (t) => {
+  const root = temporaryRepo(t);
+  const script = `
+import fs from "node:fs";
+import { syncBuiltinESMExports } from "node:module";
+
+const root = ${JSON.stringify(root)};
+const originalLstatSync = fs.lstatSync;
+const originalFstatSync = fs.fstatSync;
+let lstatCalls = 0;
+let fstatCalls = 0;
+fs.lstatSync = (path, options) => {
+  const caller = new Error().stack.split("\\n")[2] ?? "";
+  if (!caller.includes("node:fs")) {
+    if (options?.bigint !== true) throw new Error("lstatSync used a lossy identity");
+    lstatCalls += 1;
+  }
+  return originalLstatSync(path, options);
+};
+fs.fstatSync = (descriptor, options) => {
+  if (options?.bigint !== true) throw new Error("fstatSync used a lossy identity");
+  fstatCalls += 1;
+  return originalFstatSync(descriptor, options);
+};
+syncBuiltinESMExports();
+
+const { checkProject } = await import(${JSON.stringify(pathToFileURL(join(packageRoot, "src", "index.mjs")).href)});
+checkProject(root);
+if (lstatCalls === 0 || fstatCalls === 0) throw new Error("Filesystem identity probes did not run.");
+`;
+  const result = spawnSync(process.execPath, ["--input-type=module", "--eval", script], {
+    encoding: "utf8",
+  });
+
+  assert.equal(result.status, 0, result.stderr);
+  assert.equal(runCli(root, "sync").status, 0);
+  assert.equal(runCli(root, "check").status, 0);
+});
+
+test("fails closed when the filesystem reports an unusable zero inode", (t) => {
+  const root = temporaryRepo(t);
+  const originalFiles = snapshotFiles(root);
+  const script = `
+import fs from "node:fs";
+import { syncBuiltinESMExports } from "node:module";
+
+const root = ${JSON.stringify(root)};
+const originalLstatSync = fs.lstatSync;
+fs.lstatSync = (path, options) => {
+  const stats = originalLstatSync(path, options);
+  if (path === root) stats.ino = 0n;
+  return stats;
+};
+syncBuiltinESMExports();
+
+const { syncProject } = await import(${JSON.stringify(pathToFileURL(join(packageRoot, "src", "index.mjs")).href)});
+let failure = null;
+try {
+  syncProject(root);
+} catch (error) {
+  failure = error;
+}
+if (!failure) throw new Error("Synchronization accepted an unusable zero inode.");
+`;
+  const result = spawnSync(process.execPath, ["--input-type=module", "--eval", script], {
+    encoding: "utf8",
+  });
+
+  assert.equal(result.status, 0, result.stderr);
+  assert.deepEqual(snapshotFiles(root), originalFiles);
+});
+
+test("reports the synchronous API main-thread requirement from workers", (t) => {
+  const root = temporaryRepo(t);
+  const moduleUrl = pathToFileURL(join(packageRoot, "src", "index.mjs")).href;
+  const workerScript = `
+import { parentPort } from "node:worker_threads";
+import(${JSON.stringify(moduleUrl)}).then(({ checkProject }) => {
+  try {
+    checkProject(${JSON.stringify(root)});
+    parentPort.postMessage({ ok: true });
+  } catch (error) {
+    parentPort.postMessage({ message: error.message, name: error.name, ok: false });
+  }
+});
+`;
+  const controllerScript = `
+import { Worker } from "node:worker_threads";
+const worker = new Worker(${JSON.stringify(workerScript)}, { eval: true });
+const result = await new Promise((resolveResult, rejectResult) => {
+  worker.once("message", resolveResult);
+  worker.once("error", rejectResult);
+});
+if (result.ok || result.name !== "GuidanceError" || !/main Node.js thread/.test(result.message)) {
+  throw new Error(JSON.stringify(result));
+}
+`;
+  const result = spawnSync(
+    process.execPath,
+    ["--input-type=module", "--eval", controllerScript],
+    { encoding: "utf8" },
+  );
+
+  assert.equal(result.status, 0, result.stderr);
+});
+
+test(
+  "rejects a FIFO canonical source without waiting for a writer",
+  { skip: process.platform === "win32" },
+  (t) => {
+    const root = temporaryRepo(t);
+    const guidePath = join(root, ".agents", "guide.md");
+    rmSync(guidePath);
+    const created = spawnSync("mkfifo", [guidePath], { encoding: "utf8" });
+    if (created.status !== 0) {
+      t.skip(`mkfifo is unavailable: ${created.stderr}`);
+      return;
+    }
+
+    const check = spawnSync(process.execPath, [cliPath, "check"], {
+      cwd: root,
+      encoding: "utf8",
+      timeout: 2_000,
+    });
+    assert.notEqual(check.error?.code, "ETIMEDOUT");
+    assert.equal(check.status, 1);
+    assert.match(check.stderr, /Canonical source is not a regular file/);
+  },
+);
+
+test("preserves meaningful leading indentation and trailing Markdown spaces", (t) => {
+  const root = temporaryRepo(t);
+  const guide = "    indented code\n\nParagraph with a hard break  \n\n";
+  writeFileSync(join(root, ".agents", "guide.md"), guide);
+
+  const sync = runCli(root, "sync");
+  assert.equal(sync.status, 0, sync.stderr);
+  assert.equal(
+    read(root, "AGENTS.md"),
+    `${read(expectedRoot, "AGENTS.md").split("\n")[0]}\n\n    indented code\n\nParagraph with a hard break  \n`,
+  );
+  assert.equal(runCli(root, "check").status, 0);
+});
+
+test("preserves unmanaged targets and aborts the entire default sync", (t) => {
+  const root = temporaryRepo(t);
+  write(root, "AGENTS.md", "# Handwritten guidance\n");
+
+  const sync = runCli(root, "sync");
+  assert.equal(sync.status, 1);
+  assert.match(sync.stderr, /unmanaged: AGENTS\.md/);
+  assert.equal(read(root, "AGENTS.md"), "# Handwritten guidance\n");
+  for (const relativePath of generatedPaths.slice(1)) {
+    assert.equal(lstatIfExists(join(root, relativePath)), null);
+  }
+});
+
+test("adopts only unmanaged files whose payload already matches", (t) => {
+  const matchingRoot = temporaryRepo(t);
+  write(matchingRoot, "AGENTS.md", read(matchingRoot, ".agents/guide.md"));
+
+  const adopt = runCli(matchingRoot, "sync", "--adopt");
+  assert.equal(adopt.status, 0, adopt.stderr);
+  assert.match(adopt.stdout, /adopt: AGENTS\.md/);
+  assert.equal(read(matchingRoot, "AGENTS.md"), read(expectedRoot, "AGENTS.md"));
+
+  const differingRoot = temporaryRepo(t);
+  write(differingRoot, "AGENTS.md", "# Different guidance\n");
+  const rejected = runCli(differingRoot, "sync", "--adopt");
+  assert.equal(rejected.status, 1);
+  assert.match(rejected.stderr, /content differs from the generated payload/);
+  assert.equal(read(differingRoot, "AGENTS.md"), "# Different guidance\n");
+  assert.equal(lstatIfExists(join(differingRoot, "CLAUDE.md")), null);
+});
+
+test("force replaces differing unmanaged regular files", (t) => {
+  const root = temporaryRepo(t);
+  write(root, "AGENTS.md", "# Different guidance\n");
+
+  const sync = runCli(root, "sync", "--force");
+  assert.equal(sync.status, 0, sync.stderr);
+  assert.match(sync.stdout, /replace: AGENTS\.md/);
+  assert.equal(read(root, "AGENTS.md"), read(expectedRoot, "AGENTS.md"));
+});
+
+test("requires the exact target-specific ownership marker", (t) => {
+  const root = temporaryRepo(t);
+  const wrongMarker =
+    '<!-- agent-guidance-sync:generated:v1 source=".agents/guide.md" target=".github/copilot-instructions.md" -->';
+  write(root, "AGENTS.md", `${wrongMarker}\n\n${read(root, ".agents/guide.md")}`);
+
+  const sync = runCli(root, "sync");
+  assert.equal(sync.status, 1);
+  assert.match(sync.stderr, /unmanaged: AGENTS\.md/);
+  assert.equal(read(root, "AGENTS.md").startsWith(wrongMarker), true);
+});
+
+test("adapter toggles never turn an unmanaged header position into ownership", (t) => {
+  const root = temporaryRepo(t);
+  const marker = read(expectedRoot, "AGENTS.md").split("\n")[0];
+  const unmanaged = `---\ncustom: true\n---\n\n${marker}\n\n# Handwritten guidance\n`;
+  write(root, "AGENTS.md", unmanaged);
+
+  const enabledSync = runCli(root, "sync");
+  assert.equal(enabledSync.status, 1);
+  assert.match(enabledSync.stderr, /unmanaged: AGENTS\.md/);
+  assert.equal(read(root, "AGENTS.md"), unmanaged);
+
+  writeFileSync(
+    join(root, ".agents", "config.yaml"),
+    `version: 1
+adapters:
+  agents: false
+  claude: false
+  cursor: false
+  copilot: false
+`,
+  );
+  const disabledCheck = runCli(root, "check");
+  assert.equal(disabledCheck.status, 0, disabledCheck.stderr);
+  const disabledSync = runCli(root, "sync");
+  assert.equal(disabledSync.status, 0, disabledSync.stderr);
+  assert.equal(read(root, "AGENTS.md"), unmanaged);
+});
+
+test("does not claim a marker shown as content instead of the generated header", (t) => {
+  const root = temporaryRepo(t);
+  const correctMarker = read(expectedRoot, "AGENTS.md").split("\n")[0];
+  const handwritten = `# Ownership marker example
+
+\`\`\`html
+${correctMarker}
+\`\`\`
+`;
+  write(root, "AGENTS.md", handwritten);
+
+  const sync = runCli(root, "sync");
+  assert.equal(sync.status, 1);
+  assert.match(sync.stderr, /unmanaged: AGENTS\.md/);
+  assert.equal(read(root, "AGENTS.md"), handwritten);
+  assert.equal(lstatIfExists(join(root, "CLAUDE.md")), null);
+});
+
+test("remains idempotent when canonical guidance contains an ownership marker example", (t) => {
+  const root = temporaryRepo(t);
+  const marker = read(expectedRoot, "AGENTS.md").split("\n")[0];
+  writeFileSync(
+    join(root, ".agents", "guide.md"),
+    `# Marker documentation\n\nExample generated header:\n\n${marker}\n`,
+  );
+
+  const sync = runCli(root, "sync");
+  assert.equal(sync.status, 0, sync.stderr);
+  const check = runCli(root, "check");
+  assert.equal(check.status, 0, check.stderr);
+  assert.equal(read(root, "AGENTS.md").split(marker).length - 1, 2);
+});
+
+test(
+  "never follows or replaces a generated file symlink, including with force",
+  (t) => {
+    const root = temporaryRepo(t);
+    const outside = join(temporaryDirectory(t, "agent-guidance-outside-"), "sentinel.md");
+    writeFileSync(outside, "outside\n");
+    if (!createSymlinkOrSkip(t, outside, join(root, "AGENTS.md"), "file")) return;
+
+    const check = runCli(root, "check");
+    assert.equal(check.status, 1);
+    assert.match(check.stderr, /unsafe: AGENTS\.md .*target is a symlink/);
+
+    const sync = runCli(root, "sync", "--force");
+    assert.equal(sync.status, 1);
+    assert.equal(lstatSync(join(root, "AGENTS.md")).isSymbolicLink(), true);
+    assert.equal(readFileSync(outside, "utf8"), "outside\n");
+    assert.equal(lstatIfExists(join(root, "CLAUDE.md")), null);
+  },
+);
+
+test(
+  "rejects generated directories that traverse symlinks without partial writes",
+  (t) => {
+    const root = temporaryRepo(t);
+    const outside = temporaryDirectory(t, "agent-guidance-outside-");
+    writeFileSync(join(outside, "sentinel"), "outside\n");
+    if (!createSymlinkOrSkip(t, outside, join(root, ".cursor"), "dir")) return;
+
+    const sync = runCli(root, "sync", "--force");
+    assert.equal(sync.status, 1);
+    assert.match(sync.stderr, /generated path traverses a symlink: \.cursor/);
+    assert.equal(readFileSync(join(outside, "sentinel"), "utf8"), "outside\n");
+    assert.equal(lstatIfExists(join(root, "AGENTS.md")), null);
+  },
+);
+
+test(
+  "classifies generated targets through verified parent directories",
+  { skip: process.platform === "win32" },
+  (t) => {
+    const root = temporaryRepo(t);
+    assert.equal(runCli(root, "sync").status, 0);
+    const parent = join(root, ".github");
+    const movedParent = join(root, ".github-original");
+    const outsideContainer = temporaryDirectory(t, "agent-guidance-classify-parent-outside-");
+    const outsideParent = join(outsideContainer, "github");
+    cpSync(parent, outsideParent, { recursive: true });
+    const targetPath = join(parent, "copilot-instructions.md");
+    const originalFiles = snapshotFiles(parent);
+    const outsideFiles = snapshotFiles(outsideParent);
+
+    const script = `
+import fs from "node:fs";
+import { syncBuiltinESMExports } from "node:module";
+
+const root = ${JSON.stringify(root)};
+const parent = ${JSON.stringify(parent)};
+const movedParent = ${JSON.stringify(movedParent)};
+const outsideParent = ${JSON.stringify(outsideParent)};
+const targetPath = ${JSON.stringify(targetPath)};
+const originalLstatSync = fs.lstatSync;
+const originalOpenSync = fs.openSync;
+let externalAccess = false;
+let swapped = false;
+fs.lstatSync = (path, options) => {
+  const stats = originalLstatSync(path, options);
+  if (!swapped && path === parent) {
+    fs.renameSync(parent, movedParent);
+    fs.symlinkSync(outsideParent, parent, "dir");
+    swapped = true;
+  }
+  return stats;
+};
+fs.openSync = (path, flags, mode) => {
+  if (swapped && path === targetPath) externalAccess = true;
+  return originalOpenSync(path, flags, mode);
+};
+syncBuiltinESMExports();
+
+const { planProject } = await import(${JSON.stringify(pathToFileURL(join(packageRoot, "src", "index.mjs")).href)});
+let failure = null;
+try {
+  planProject(root);
+} catch (error) {
+  failure = error;
+}
+if (!swapped) throw new Error("The generated-target parent substitution was not injected.");
+if (externalAccess) throw new Error("Planning read a target through the replacement parent.");
+if (!failure) throw new Error("Planning accepted a replacement generated-target parent.");
+const failureMessages = [];
+for (let current = failure; current; current = current.cause) failureMessages.push(current.message);
+if (!failureMessages.some((message) => /parent changed while guidance was being planned/.test(message))) {
+  throw failure;
+}
+`;
+    const result = spawnSync(process.execPath, ["--input-type=module", "--eval", script], {
+      encoding: "utf8",
+    });
+
+    assert.equal(result.status, 0, result.stderr);
+    assert.deepEqual(snapshotFiles(movedParent), originalFiles);
+    assert.deepEqual(snapshotFiles(outsideParent), outsideFiles);
+    assert.equal(lstatSync(parent).isSymbolicLink(), true);
+  },
+);
+
+test(
+  "rejects same-inode symlink replacements before update publication",
+  { skip: process.platform === "win32" },
+  (t) => {
+    const root = temporaryRepo(t);
+    writeFileSync(
+      join(root, ".agents", "config.yaml"),
+      `version: 1
+adapters:
+  agents: false
+  claude: false
+  cursor: false
+  copilot: true
+`,
+    );
+    assert.equal(runCli(root, "sync").status, 0);
+    const parent = join(root, ".github");
+    const targetPath = join(parent, "copilot-instructions.md");
+    const originalTarget = readFileSync(targetPath, "utf8");
+    writeFileSync(join(root, ".agents", "guide.md"), "# Updated guidance\n");
+    const outside = temporaryDirectory(t, "agent-guidance-publication-parent-outside-");
+    const movedParent = join(outside, "github");
+
+    const script = `
+import fs from "node:fs";
+import { syncBuiltinESMExports } from "node:module";
+import { basename } from "node:path";
+
+const root = ${JSON.stringify(root)};
+const parent = ${JSON.stringify(parent)};
+const movedParent = ${JSON.stringify(movedParent)};
+const originalChdir = process.chdir;
+const originalOpenSync = fs.openSync;
+let staged = false;
+let swapped = false;
+fs.openSync = (path, flags, mode) => {
+  const descriptor = originalOpenSync(path, flags, mode);
+  if (
+    typeof path === "string" &&
+    basename(path).startsWith(".copilot-instructions.md.") &&
+    path.endsWith(".tmp")
+  ) {
+    staged = true;
+  }
+  return descriptor;
+};
+process.chdir = (path) => {
+  if (!swapped && staged && path === parent) {
+    fs.renameSync(parent, movedParent);
+    fs.symlinkSync(movedParent, parent, "dir");
+    swapped = true;
+  }
+  return originalChdir(path);
+};
+syncBuiltinESMExports();
+
+const { syncProject } = await import(${JSON.stringify(pathToFileURL(join(packageRoot, "src", "index.mjs")).href)});
+let failure = null;
+try {
+  syncProject(root);
+} catch (error) {
+  failure = error;
+}
+if (!staged) throw new Error("The generated update was not staged.");
+if (!swapped) throw new Error("The same-inode parent substitution was not injected.");
+if (!failure) throw new Error("Synchronization published through a same-inode symlink.");
+const failureMessages = [];
+for (let current = failure; current; current = current.cause) failureMessages.push(current.message);
+if (!failureMessages.some((message) => /parent directory changed before publication/.test(message))) {
+  throw failure;
+}
+`;
+    const result = spawnSync(process.execPath, ["--input-type=module", "--eval", script], {
+      encoding: "utf8",
+    });
+
+    assert.equal(result.status, 0, result.stderr);
+    assert.equal(readFileSync(join(movedParent, "copilot-instructions.md"), "utf8"), originalTarget);
+    assert.equal(lstatSync(parent).isSymbolicLink(), true);
+    assert.equal(listFiles(movedParent).some((path) => path.endsWith(".tmp")), false);
+  },
+);
+
+test(
+  "aborts planning when the verified project root is replaced",
+  { skip: process.platform === "win32" },
+  (t) => {
+    const container = temporaryDirectory(t);
+    const root = join(container, "repo");
+    const movedRoot = join(container, "repo-original");
+    const replacementRoot = join(container, "repo-replacement");
+    cpSync(join(fixtureRoot, ".agents"), join(root, ".agents"), { recursive: true });
+    cpSync(join(fixtureRoot, ".agents"), join(replacementRoot, ".agents"), {
+      recursive: true,
+    });
+    const originalFiles = snapshotFiles(root);
+    const replacementFiles = snapshotFiles(replacementRoot);
+
+    const script = `
+import fs from "node:fs";
+import { syncBuiltinESMExports } from "node:module";
+
+const root = ${JSON.stringify(root)};
+const movedRoot = ${JSON.stringify(movedRoot)};
+const replacementRoot = ${JSON.stringify(replacementRoot)};
+const originalLstatSync = fs.lstatSync;
+let rootStatReads = 0;
+let swapped = false;
+fs.lstatSync = (path, options) => {
+  const stats = originalLstatSync(path, options);
+  if (!swapped && path === root) {
+    rootStatReads += 1;
+    if (rootStatReads === 2) {
+      fs.renameSync(root, movedRoot);
+      fs.renameSync(replacementRoot, root);
+      swapped = true;
+    }
+  }
+  return stats;
+};
+syncBuiltinESMExports();
+
+const { syncProject } = await import(${JSON.stringify(pathToFileURL(join(packageRoot, "src", "index.mjs")).href)});
+let failure = null;
+try {
+  syncProject(root);
+} catch (error) {
+  failure = error;
+}
+if (!swapped) throw new Error("The project-root substitution was not injected during planning.");
+if (!failure) throw new Error("Synchronization accepted a replacement project root.");
+const failureMessages = [];
+for (let current = failure; current; current = current.cause) failureMessages.push(current.message);
+if (!failureMessages.some((message) => /Project root changed while guidance was being planned/.test(message))) {
+  throw failure;
+}
+`;
+    const result = spawnSync(process.execPath, ["--input-type=module", "--eval", script], {
+      encoding: "utf8",
+    });
+
+    assert.equal(result.status, 0, result.stderr);
+    assert.deepEqual(snapshotFiles(movedRoot), originalFiles);
+    assert.deepEqual(snapshotFiles(root), replacementFiles);
+  },
+);
+
+test(
+  "never stages generated files after the verified project root is replaced",
+  { skip: process.platform === "win32" },
+  (t) => {
+    const container = temporaryDirectory(t);
+    const root = join(container, "repo");
+    const movedRoot = join(container, "repo-original");
+    const replacementRoot = join(container, "repo-replacement");
+    cpSync(join(fixtureRoot, ".agents"), join(root, ".agents"), { recursive: true });
+    cpSync(join(fixtureRoot, ".agents"), join(replacementRoot, ".agents"), {
+      recursive: true,
+    });
+    const originalFiles = snapshotFiles(root);
+    const replacementFiles = snapshotFiles(replacementRoot);
+
+    const script = `
+import fs from "node:fs";
+import { syncBuiltinESMExports } from "node:module";
+
+const root = ${JSON.stringify(root)};
+const movedRoot = ${JSON.stringify(movedRoot)};
+const replacementRoot = ${JSON.stringify(replacementRoot)};
+const originalOpenSync = fs.openSync;
+let swapped = false;
+fs.openSync = (path, flags, mode) => {
+  if (
+    !swapped &&
+    typeof path === "string" &&
+    path.startsWith(".AGENTS.md.") &&
+    path.endsWith(".tmp")
+  ) {
+    fs.renameSync(root, movedRoot);
+    fs.renameSync(replacementRoot, root);
+    swapped = true;
+  }
+  return originalOpenSync(path, flags, mode);
+};
+syncBuiltinESMExports();
+
+const { syncProject } = await import(${JSON.stringify(pathToFileURL(join(packageRoot, "src", "index.mjs")).href)});
+let failure = null;
+try {
+  syncProject(root);
+} catch (error) {
+  failure = error;
+}
+if (!swapped) throw new Error("The project-root substitution was not injected during staging.");
+if (!failure) throw new Error("Synchronization staged through a replacement project root.");
+const failureMessages = [];
+for (let current = failure; current; current = current.cause) failureMessages.push(current.message);
+if (!failureMessages.some((message) => /Project root changed while guidance was being staged/.test(message))) {
+  throw failure;
+}
+`;
+    const result = spawnSync(process.execPath, ["--input-type=module", "--eval", script], {
+      encoding: "utf8",
+    });
+
+    assert.equal(result.status, 0, result.stderr);
+    assert.deepEqual(snapshotFiles(movedRoot), originalFiles);
+    assert.deepEqual(snapshotFiles(root), replacementFiles);
+  },
+);
+
+test(
+  "does not create parent directories through a symlink introduced during staging",
+  async (t) => {
+    const root = temporaryRepo(t);
+    const outside = temporaryDirectory(t, "agent-guidance-parent-race-outside-");
+    const probePath = join(root, ".agent-guidance-directory-symlink-probe");
+    if (!createSymlinkOrSkip(t, outside, probePath, "dir")) return;
+    rmSync(probePath);
+    writeFileSync(
+      join(root, ".agents", "guide.md"),
+      `# Large directory race fixture\n\n${"x".repeat(8 * 1024 * 1024)}\n`,
+    );
+
+    const { child, completed } = runCliAsync(root, "sync");
+    const deadline = Date.now() + 10_000;
+    let injected = false;
+    while (child.exitCode === null && Date.now() < deadline) {
+      const temporaryAgentFile = readdirSync(root).find(
+        (entry) => entry.startsWith(".AGENTS.md.") && entry.endsWith(".tmp"),
+      );
+      if (temporaryAgentFile) {
+        symlinkSync(
+          outside,
+          join(root, ".cursor"),
+          process.platform === "win32" ? "junction" : "dir",
+        );
+        injected = true;
+        break;
+      }
+      await delay(1);
+    }
+
+    const sync = await completed;
+    assert.equal(injected, true, `Could not intercept staged write; stderr: ${sync.stderr}`);
+    assert.equal(sync.status, 1);
+    assert.match(sync.stderr, /generated path traverses a symlink: \.cursor/);
+    assert.equal(lstatIfExists(join(outside, "rules")), null);
+    assert.equal(lstatSync(join(root, ".cursor")).isSymbolicLink(), true);
+    assert.equal(lstatIfExists(join(root, "AGENTS.md")), null);
+    assert.equal(lstatIfExists(join(root, "CLAUDE.md")), null);
+    assert.equal(listFiles(root).some((path) => path.endsWith(".tmp")), false);
+  },
+);
+
+test(
+  "creates each generated parent through its verified ancestor directory",
+  { skip: process.platform === "win32" },
+  (t) => {
+    const root = temporaryRepo(t);
+    const cursorPath = join(root, ".cursor");
+    const movedCursorPath = join(root, ".cursor-original");
+    const outside = temporaryDirectory(t, "agent-guidance-parent-create-outside-");
+    mkdirSync(cursorPath);
+
+    const script = `
+import fs from "node:fs";
+import { syncBuiltinESMExports } from "node:module";
+import { basename, join } from "node:path";
+
+const root = ${JSON.stringify(root)};
+const cursorPath = ${JSON.stringify(cursorPath)};
+const movedCursorPath = ${JSON.stringify(movedCursorPath)};
+const outside = ${JSON.stringify(outside)};
+const originalMkdirSync = fs.mkdirSync;
+let swapped = false;
+fs.mkdirSync = (path, options) => {
+  if (!swapped && typeof path === "string" && basename(path) === "rules") {
+    fs.renameSync(cursorPath, movedCursorPath);
+    fs.symlinkSync(outside, cursorPath, "dir");
+    swapped = true;
+  }
+  const result = originalMkdirSync(path, options);
+  if (fs.existsSync(join(outside, "rules"))) {
+    process.stdout.write("external-rules-created\\n");
+  }
+  return result;
+};
+syncBuiltinESMExports();
+
+const { syncProject } = await import(${JSON.stringify(pathToFileURL(join(packageRoot, "src", "index.mjs")).href)});
+let failure = null;
+try {
+  syncProject(root);
+} catch (error) {
+  failure = error;
+}
+if (!swapped) throw new Error("The parent-directory substitution was not injected.");
+if (!failure || !/generated path traverses a symlink|changed while parents were being created/.test(failure.message)) {
+  throw failure;
+}
+`;
+    const result = spawnSync(process.execPath, ["--input-type=module", "--eval", script], {
+      encoding: "utf8",
+    });
+
+    assert.equal(result.status, 0, result.stderr);
+    assert.doesNotMatch(result.stdout, /external-rules-created/);
+    assert.deepEqual(listFiles(outside), []);
+    assert.deepEqual(listFiles(movedCursorPath), []);
+    assert.equal(listFiles(root).some((path) => path.endsWith(".tmp")), false);
+  },
+);
+
+test(
+  "stages generated temporary files through their verified parent directory",
+  { skip: process.platform === "win32" },
+  (t) => {
+    const root = temporaryRepo(t);
+    const rulesPath = join(root, ".cursor", "rules");
+    const movedRulesPath = join(root, ".cursor-rules-original");
+    const outside = temporaryDirectory(t, "agent-guidance-stage-parent-outside-");
+    mkdirSync(rulesPath, { recursive: true });
+
+    const script = `
+import fs from "node:fs";
+import { syncBuiltinESMExports } from "node:module";
+import { basename } from "node:path";
+
+const root = ${JSON.stringify(root)};
+const rulesPath = ${JSON.stringify(rulesPath)};
+const movedRulesPath = ${JSON.stringify(movedRulesPath)};
+const outside = ${JSON.stringify(outside)};
+const originalOpenSync = fs.openSync;
+let swapped = false;
+fs.openSync = (path, flags, mode) => {
+  if (
+    !swapped &&
+    typeof path === "string" &&
+    basename(path).startsWith(".agent-guidance.mdc.") &&
+    path.endsWith(".tmp")
+  ) {
+    fs.renameSync(rulesPath, movedRulesPath);
+    fs.symlinkSync(outside, rulesPath, "dir");
+    swapped = true;
+  }
+  const descriptor = originalOpenSync(path, flags, mode);
+  if (fs.readdirSync(outside).some((entry) => entry.endsWith(".tmp"))) {
+    process.stdout.write("external-temp-opened\\n");
+  }
+  return descriptor;
+};
+syncBuiltinESMExports();
+
+const { syncProject } = await import(${JSON.stringify(pathToFileURL(join(packageRoot, "src", "index.mjs")).href)});
+let failure = null;
+try {
+  syncProject(root);
+} catch (error) {
+  failure = error;
+}
+if (!swapped) throw new Error("The staging substitution was not injected.");
+const failureMessages = [];
+for (let current = failure; current; current = current.cause) failureMessages.push(current.message);
+if (!failureMessages.some((message) => /parent directory changed while staging/.test(message))) {
+  throw failure;
+}
+`;
+    const result = spawnSync(process.execPath, ["--input-type=module", "--eval", script], {
+      encoding: "utf8",
+    });
+
+    assert.equal(result.status, 0, result.stderr);
+    assert.doesNotMatch(result.stdout, /external-temp-opened/);
+    assert.deepEqual(listFiles(outside), []);
+    assert.deepEqual(listFiles(movedRulesPath), []);
+    assert.equal(listFiles(root).some((path) => path.endsWith(".tmp")), false);
+  },
+);
+
+test(
+  "pins a generated parent identity before an ancestor is replaced with a real directory",
+  { skip: process.platform === "win32" },
+  (t) => {
+    const root = temporaryRepo(t);
+    const cursorPath = join(root, ".cursor");
+    const movedCursorPath = join(root, ".cursor-original");
+    const replacementCursorPath = join(root, ".cursor-replacement");
+    mkdirSync(join(cursorPath, "rules"), { recursive: true });
+    mkdirSync(join(replacementCursorPath, "rules"), { recursive: true });
+    write(replacementCursorPath, "rules/sentinel", "outside\n");
+    const realCursorPath = realpathSync(cursorPath);
+    const replacementBefore = snapshotFiles(replacementCursorPath);
+
+    const script = `
+import fs from "node:fs";
+import { syncBuiltinESMExports } from "node:module";
+
+const root = ${JSON.stringify(root)};
+const cursorPath = ${JSON.stringify(cursorPath)};
+const realCursorPath = ${JSON.stringify(realCursorPath)};
+const movedCursorPath = ${JSON.stringify(movedCursorPath)};
+const replacementCursorPath = ${JSON.stringify(replacementCursorPath)};
+const originalChdir = process.chdir;
+let swapped = false;
+process.chdir = (path) => {
+  const current = process.cwd();
+  const stack = new Error().stack ?? "";
+  const result = originalChdir(path);
+  if (
+    !swapped &&
+    current === realCursorPath &&
+    stack.includes("ensureTargetParentDirectories")
+  ) {
+    fs.renameSync(cursorPath, movedCursorPath);
+    fs.renameSync(replacementCursorPath, cursorPath);
+    swapped = true;
+  }
+  return result;
+};
+syncBuiltinESMExports();
+
+const { syncProject } = await import(${JSON.stringify(pathToFileURL(join(packageRoot, "src", "index.mjs")).href)});
+let failure = null;
+try {
+  syncProject(root);
+} catch (error) {
+  failure = error;
+}
+if (!swapped) {
+  if (failure) throw failure;
+  throw new Error("The generated ancestor substitution was not injected.");
+}
+if (!failure) throw new Error("Synchronization accepted a replacement generated ancestor.");
+const failureMessages = [];
+for (let current = failure; current; current = current.cause) failureMessages.push(current.message);
+if (!failureMessages.some((message) => /parent directory changed while staging/.test(message))) {
+  throw failure;
+}
+`;
+    const result = spawnSync(process.execPath, ["--input-type=module", "--eval", script], {
+      encoding: "utf8",
+    });
+
+    assert.equal(result.status, 0, result.stderr);
+    assert.deepEqual(snapshotFiles(cursorPath), replacementBefore);
+    assert.deepEqual(snapshotFiles(movedCursorPath), {});
+    assert.equal(listFiles(root).some((path) => path.endsWith(".tmp")), false);
+    assert.equal(lstatIfExists(join(root, "AGENTS.md")), null);
+  },
+);
+
+test(
+  "publishes generated files through their verified parent directory",
+  { skip: process.platform === "win32" },
+  (t) => {
+    const root = temporaryRepo(t);
+    const rulesPath = join(root, ".cursor", "rules");
+    const movedRulesPath = join(root, ".cursor-rules-original");
+    const outside = temporaryDirectory(t, "agent-guidance-publish-parent-outside-");
+    mkdirSync(rulesPath, { recursive: true });
+
+    const script = `
+import fs from "node:fs";
+import { syncBuiltinESMExports } from "node:module";
+import { basename, join } from "node:path";
+
+const root = ${JSON.stringify(root)};
+const rulesPath = ${JSON.stringify(rulesPath)};
+const movedRulesPath = ${JSON.stringify(movedRulesPath)};
+const outside = ${JSON.stringify(outside)};
+const originalLinkSync = fs.linkSync;
+let swapped = false;
+fs.linkSync = (source, destination) => {
+  if (
+    !swapped &&
+    typeof destination === "string" &&
+    basename(destination) === "agent-guidance.mdc"
+  ) {
+    fs.renameSync(rulesPath, movedRulesPath);
+    fs.symlinkSync(outside, rulesPath, "dir");
+    swapped = true;
+  }
+  const result = originalLinkSync(source, destination);
+  if (fs.existsSync(join(outside, "agent-guidance.mdc"))) {
+    process.stdout.write("external-output-published\\n");
+  }
+  return result;
+};
+syncBuiltinESMExports();
+
+const { syncProject } = await import(${JSON.stringify(pathToFileURL(join(packageRoot, "src", "index.mjs")).href)});
+let failure = null;
+try {
+  syncProject(root);
+} catch (error) {
+  failure = error;
+}
+if (!swapped) throw new Error("The publication substitution was not injected.");
+const failureMessages = [];
+for (let current = failure; current; current = current.cause) failureMessages.push(current.message);
+if (!failureMessages.some((message) => /parent directory changed during publication/.test(message))) {
+  throw failure;
+}
+`;
+    const result = spawnSync(process.execPath, ["--input-type=module", "--eval", script], {
+      encoding: "utf8",
+    });
+
+    assert.equal(result.status, 0, result.stderr);
+    assert.doesNotMatch(result.stdout, /external-output-published/);
+    assert.deepEqual(listFiles(outside), []);
+    assert.deepEqual(listFiles(movedRulesPath), []);
+    assert.equal(listFiles(root).some((path) => path.endsWith(".tmp")), false);
+  },
+);
+
+test("sync rejects staged contents changed before create or replacement publication", (t) => {
+  for (const action of ["create", "update"]) {
+    const root = temporaryRepo(t);
+    let generatedBefore = null;
+    if (action === "update") {
+      const initialSync = runCli(root, "sync");
+      assert.equal(initialSync.status, 0, initialSync.stderr);
+      generatedBefore = Object.fromEntries(
+        generatedPaths.map((relativePath) => [relativePath, read(root, relativePath)]),
+      );
+      writeFileSync(join(root, ".agents", "guide.md"), "# Updated guidance\n");
+    }
+
+    const script = `
+import fs from "node:fs";
+import { syncBuiltinESMExports } from "node:module";
+import { basename } from "node:path";
+
+const root = ${JSON.stringify(root)};
+const originalOpenSync = fs.openSync;
+let stagedReads = 0;
+let tampered = false;
+fs.openSync = (path, flags, mode) => {
+  if (
+    !tampered &&
+    typeof path === "string" &&
+    typeof flags === "number" &&
+    basename(path).startsWith(".AGENTS.md.") &&
+    path.endsWith(".tmp")
+  ) {
+    stagedReads += 1;
+    if (stagedReads === 2) {
+      tampered = true;
+      fs.writeFileSync(path, "tampered generated guidance\\n");
+    }
+  }
+  return originalOpenSync(path, flags, mode);
+};
+syncBuiltinESMExports();
+
+const { syncProject } = await import(${JSON.stringify(pathToFileURL(join(packageRoot, "src", "index.mjs")).href)});
+let failure = null;
+try {
+  syncProject(root);
+} catch (error) {
+  failure = error;
+}
+if (!tampered) throw new Error("The staged generated file was not changed.");
+const failureMessages = [];
+for (let current = failure; current; current = current.cause) failureMessages.push(current.message);
+if (!failureMessages.some((message) => /temporary file changed before publication/.test(message))) {
+  throw failure;
+}
+`;
+    const result = spawnSync(process.execPath, ["--input-type=module", "--eval", script], {
+      encoding: "utf8",
+    });
+
+    assert.equal(result.status, 0, `${action}: ${result.stderr}`);
+    if (action === "create") {
+      for (const relativePath of generatedPaths) {
+        assert.equal(lstatIfExists(join(root, relativePath)), null);
+      }
+    } else {
+      for (const relativePath of generatedPaths) {
+        assert.equal(read(root, relativePath), generatedBefore[relativePath]);
+      }
+    }
+    assert.equal(listFiles(root).some((path) => path.endsWith(".tmp")), false);
+  }
+});
+
+test("sync rejects canonical changes during create, update, and deletion commits", (t) => {
+  for (const action of ["create", "update", "delete"]) {
+    const root = temporaryRepo(t);
+    if (action === "update") {
+      assert.equal(runCli(root, "sync").status, 0);
+      writeFileSync(join(root, ".agents", "guide.md"), "# Planned guidance\n");
+    }
+    if (action === "delete") {
+      writeFileSync(
+        join(root, ".agents", "config.yaml"),
+        `version: 1
+adapters:
+  agents: false
+  claude: false
+  cursor: false
+  copilot: true
+`,
+      );
+      assert.equal(runCli(root, "sync").status, 0);
+      writeFileSync(
+        join(root, ".agents", "config.yaml"),
+        `version: 1
+adapters:
+  agents: false
+  claude: false
+  cursor: false
+  copilot: false
+`,
+      );
+    }
+
+    const script = `
+import fs from "node:fs";
+import { syncBuiltinESMExports } from "node:module";
+import { basename, join } from "node:path";
+
+const root = ${JSON.stringify(root)};
+const action = ${JSON.stringify(action)};
+const originalLinkSync = fs.linkSync;
+const originalRenameSync = fs.renameSync;
+const originalRmSync = fs.rmSync;
+let changed = false;
+const changeCanonicalSource = () => {
+  if (changed) return;
+  changed = true;
+  if (action === "delete") {
+    fs.writeFileSync(
+      join(root, ".agents", "config.yaml"),
+      "version: 1\\nadapters:\\n  agents: false\\n  claude: false\\n  cursor: false\\n  copilot: true\\n",
+    );
+  } else {
+    fs.writeFileSync(join(root, ".agents", "guide.md"), "# Concurrent guidance\\n");
+  }
+};
+fs.linkSync = (source, destination) => {
+  const result = originalLinkSync(source, destination);
+  if (action === "create" && basename(destination) === "AGENTS.md") changeCanonicalSource();
+  return result;
+};
+fs.renameSync = (source, destination) => {
+  const result = originalRenameSync(source, destination);
+  if (action === "update" && basename(destination) === "AGENTS.md") changeCanonicalSource();
+  return result;
+};
+fs.rmSync = (path, options) => {
+  const result = originalRmSync(path, options);
+  if (action === "delete" && basename(path) === "copilot-instructions.md") {
+    changeCanonicalSource();
+  }
+  return result;
+};
+syncBuiltinESMExports();
+
+const { syncProject } = await import(${JSON.stringify(pathToFileURL(join(packageRoot, "src", "index.mjs")).href)});
+let failure = null;
+try {
+  syncProject(root);
+} catch (error) {
+  failure = error;
+}
+if (!changed) throw new Error("The concurrent canonical change was not injected.");
+if (!failure) throw new Error("Synchronization reported success after a canonical change.");
+const failureMessages = [];
+for (let current = failure; current; current = current.cause) failureMessages.push(current.message);
+if (!failureMessages.some((message) => /Canonical source changed while guidance was being synchronized/.test(message))) {
+  throw failure;
+}
+`;
+    const result = spawnSync(process.execPath, ["--input-type=module", "--eval", script], {
+      encoding: "utf8",
+    });
+
+    assert.equal(result.status, 0, `${action}: ${result.stderr}`);
+    const check = runCli(root, "check");
+    assert.equal(check.status, 1, `${action}: ${check.stderr}`);
+    assert.equal(listFiles(root).some((path) => path.endsWith(".tmp")), false);
+  }
+});
+
+test("sync revalidates every canonical file after the final render", (t) => {
+  const root = temporaryRepo(t);
+  const script = `
+import fs from "node:fs";
+import { syncBuiltinESMExports } from "node:module";
+import { join } from "node:path";
+
+const root = ${JSON.stringify(root)};
+const originalOpenSync = fs.openSync;
+let canonicalRenderReads = 0;
+let changed = false;
+fs.openSync = (path, flags, mode) => {
+  const stack = new Error().stack ?? "";
+  if (
+    !changed &&
+    path === "config.yaml" &&
+    stack.includes("readCanonicalProject") &&
+    stack.includes("assertCanonicalSourceMatchesPlan")
+  ) {
+    canonicalRenderReads += 1;
+    if (canonicalRenderReads === 3) {
+      fs.writeFileSync(join(root, ".agents", "guide.md"), "# Concurrent final render\\n");
+      changed = true;
+    }
+  }
+  return originalOpenSync(path, flags, mode);
+};
+syncBuiltinESMExports();
+
+const { syncProject } = await import(${JSON.stringify(pathToFileURL(join(packageRoot, "src", "index.mjs")).href)});
+let failure = null;
+try {
+  syncProject(root);
+} catch (error) {
+  failure = error;
+}
+if (!changed) throw new Error("The canonical final-render change was not injected.");
+if (!failure) throw new Error("Synchronization accepted a canonical final-render change.");
+const failureMessages = [];
+for (let current = failure; current; current = current.cause) failureMessages.push(current.message);
+if (!failureMessages.some((message) => /Canonical source changed while guidance was being synchronized/.test(message))) {
+  throw failure;
+}
+`;
+  const result = spawnSync(process.execPath, ["--input-type=module", "--eval", script], {
+    encoding: "utf8",
+  });
+
+  assert.equal(result.status, 0, result.stderr);
+  assert.equal(runCli(root, "check").status, 1);
+  assert.equal(listFiles(root).some((path) => path.endsWith(".tmp")), false);
+});
+
+test("sync revalidates earlier targets after create, update, and deletion commits", (t) => {
+  for (const action of ["create", "update", "delete"]) {
+    const root = temporaryRepo(t);
+    if (action === "update") {
+      assert.equal(runCli(root, "sync").status, 0);
+      writeFileSync(join(root, ".agents", "guide.md"), "# Planned guidance\n");
+    }
+    if (action === "delete") {
+      writeFileSync(
+        join(root, ".agents", "config.yaml"),
+        `version: 1
+adapters:
+  agents: true
+  claude: true
+  cursor: false
+  copilot: false
+`,
+      );
+      assert.equal(runCli(root, "sync").status, 0);
+      writeFileSync(
+        join(root, ".agents", "config.yaml"),
+        `version: 1
+adapters:
+  agents: false
+  claude: false
+  cursor: false
+  copilot: false
+`,
+      );
+    }
+
+    const script = `
+import fs from "node:fs";
+import { syncBuiltinESMExports } from "node:module";
+import { basename, join } from "node:path";
+
+const root = ${JSON.stringify(root)};
+const action = ${JSON.stringify(action)};
+const originalLinkSync = fs.linkSync;
+const originalRenameSync = fs.renameSync;
+const originalRmSync = fs.rmSync;
+const deletedTargets = [];
+let changed = false;
+const changeEarlierTarget = () => {
+  if (changed) return;
+  changed = true;
+  fs.writeFileSync(join(root, "AGENTS.md"), "concurrent generated guidance\\n");
+};
+fs.linkSync = (source, destination) => {
+  const result = originalLinkSync(source, destination);
+  if (action === "create" && basename(destination) === "CLAUDE.md") changeEarlierTarget();
+  return result;
+};
+fs.renameSync = (source, destination) => {
+  const result = originalRenameSync(source, destination);
+  if (action === "update" && basename(destination) === "agent-guidance.mdc") {
+    changeEarlierTarget();
+  }
+  return result;
+};
+fs.rmSync = (path, options) => {
+  const targetName = basename(path);
+  const targetContents =
+    action === "delete" && ["AGENTS.md", "CLAUDE.md"].includes(targetName)
+      ? fs.readFileSync(path, "utf8")
+      : null;
+  const result = originalRmSync(path, options);
+  if (targetContents !== null) {
+    deletedTargets.push({ contents: targetContents, path: join(root, targetName) });
+    if (deletedTargets.length === 2) {
+      changed = true;
+      fs.writeFileSync(deletedTargets[0].path, deletedTargets[0].contents);
+    }
+  }
+  return result;
+};
+syncBuiltinESMExports();
+
+const { syncProject } = await import(${JSON.stringify(pathToFileURL(join(packageRoot, "src", "index.mjs")).href)});
+let failure = null;
+try {
+  syncProject(root);
+} catch (error) {
+  failure = error;
+}
+if (!changed) throw new Error("The earlier generated target was not changed.");
+if (!failure) throw new Error("Synchronization reported success after an earlier target changed.");
+const failureMessages = [];
+for (let current = failure; current; current = current.cause) failureMessages.push(current.message);
+if (!failureMessages.some((message) => /AGENTS\.md changed while guidance was being synchronized/.test(message))) {
+  throw failure;
+}
+`;
+    const result = spawnSync(process.execPath, ["--input-type=module", "--eval", script], {
+      encoding: "utf8",
+    });
+
+    assert.equal(result.status, 0, `${action}: ${result.stderr}`);
+    const check = runCli(root, "check");
+    assert.equal(check.status, 1, `${action}: ${check.stderr}`);
+    assert.equal(listFiles(root).some((path) => path.endsWith(".tmp")), false);
+  }
+});
+
+test("sync repeats final target validation to detect changes during the first pass", (t) => {
+  const root = temporaryRepo(t);
+  assert.equal(runCli(root, "sync").status, 0);
+  rmSync(join(root, "CLAUDE.md"));
+
+  const script = `
+import fs from "node:fs";
+import { syncBuiltinESMExports } from "node:module";
+import { join } from "node:path";
+
+const root = ${JSON.stringify(root)};
+const originalOpenSync = fs.openSync;
+let changed = false;
+fs.openSync = (path, flags, mode) => {
+  const stack = new Error().stack ?? "";
+  if (!changed && path === "CLAUDE.md" && stack.includes("assertTargetsMatchPlan")) {
+    fs.writeFileSync(join(root, "AGENTS.md"), "concurrent final validation\\n");
+    changed = true;
+  }
+  return originalOpenSync(path, flags, mode);
+};
+syncBuiltinESMExports();
+
+const { syncProject } = await import(${JSON.stringify(pathToFileURL(join(packageRoot, "src", "index.mjs")).href)});
+let failure = null;
+try {
+  syncProject(root);
+} catch (error) {
+  failure = error;
+}
+if (!changed) throw new Error("The target final-pass change was not injected.");
+if (!failure) throw new Error("Synchronization accepted a target change during final validation.");
+const failureMessages = [];
+for (let current = failure; current; current = current.cause) failureMessages.push(current.message);
+if (!failureMessages.some((message) => /AGENTS\.md changed while guidance was being synchronized/.test(message))) {
+  throw failure;
+}
+`;
+  const result = spawnSync(process.execPath, ["--input-type=module", "--eval", script], {
+    encoding: "utf8",
+  });
+
+  assert.equal(result.status, 0, result.stderr);
+  assert.equal(runCli(root, "check").status, 1);
+  assert.equal(listFiles(root).some((path) => path.endsWith(".tmp")), false);
+});
+
+test("sync revalidates unchanged targets after create, update, and deletion commits", (t) => {
+  for (const action of ["create", "update", "delete"]) {
+    const root = temporaryRepo(t);
+    assert.equal(runCli(root, "sync").status, 0);
+    if (action === "create") {
+      rmSync(join(root, "CLAUDE.md"));
+    }
+    if (action === "update") {
+      const cursorPath = join(root, ".cursor", "rules", "agent-guidance.mdc");
+      writeFileSync(cursorPath, `${read(root, ".cursor/rules/agent-guidance.mdc")}stale\n`);
+    }
+    if (action === "delete") {
+      writeFileSync(
+        join(root, ".agents", "config.yaml"),
+        `version: 1
+adapters:
+  agents: true
+  claude: true
+  cursor: true
+  copilot: false
+`,
+      );
+    }
+
+    const script = `
+import fs from "node:fs";
+import { syncBuiltinESMExports } from "node:module";
+import { basename, join } from "node:path";
+
+const root = ${JSON.stringify(root)};
+const action = ${JSON.stringify(action)};
+const originalLinkSync = fs.linkSync;
+const originalRenameSync = fs.renameSync;
+const originalRmSync = fs.rmSync;
+let changed = false;
+const changeUnchangedTarget = () => {
+  if (changed) return;
+  changed = true;
+  fs.writeFileSync(join(root, "AGENTS.md"), "concurrent generated guidance\\n");
+};
+fs.linkSync = (source, destination) => {
+  const result = originalLinkSync(source, destination);
+  if (action === "create" && basename(destination) === "CLAUDE.md") {
+    changeUnchangedTarget();
+  }
+  return result;
+};
+fs.renameSync = (source, destination) => {
+  const result = originalRenameSync(source, destination);
+  if (action === "update" && basename(destination) === "agent-guidance.mdc") {
+    changeUnchangedTarget();
+  }
+  return result;
+};
+fs.rmSync = (path, options) => {
+  const result = originalRmSync(path, options);
+  if (action === "delete" && basename(path) === "copilot-instructions.md") {
+    changeUnchangedTarget();
+  }
+  return result;
+};
+syncBuiltinESMExports();
+
+const { syncProject } = await import(${JSON.stringify(pathToFileURL(join(packageRoot, "src", "index.mjs")).href)});
+let failure = null;
+try {
+  syncProject(root);
+} catch (error) {
+  failure = error;
+}
+if (!changed) throw new Error("The unchanged generated target was not changed.");
+if (!failure) throw new Error("Synchronization reported success after an unchanged target changed.");
+const failureMessages = [];
+for (let current = failure; current; current = current.cause) failureMessages.push(current.message);
+if (!failureMessages.some((message) => /AGENTS\.md changed while guidance was being synchronized/.test(message))) {
+  throw failure;
+}
+`;
+    const result = spawnSync(process.execPath, ["--input-type=module", "--eval", script], {
+      encoding: "utf8",
+    });
+
+    assert.equal(result.status, 0, `${action}: ${result.stderr}`);
+    const check = runCli(root, "check");
+    assert.equal(check.status, 1, `${action}: ${check.stderr}`);
+    assert.equal(listFiles(root).some((path) => path.endsWith(".tmp")), false);
+  }
+});
+
+test(
+  "sync rejects unsafe unchanged-target parents after create, update, and deletion commits",
+  { skip: process.platform === "win32" },
+  (t) => {
+    for (const action of ["create", "update", "delete"]) {
+      const root = temporaryRepo(t);
+      assert.equal(runCli(root, "sync").status, 0);
+      if (action === "create") {
+        rmSync(join(root, "CLAUDE.md"));
+      }
+      if (action === "update") {
+        const cursorPath = join(root, ".cursor", "rules", "agent-guidance.mdc");
+        writeFileSync(cursorPath, `${read(root, ".cursor/rules/agent-guidance.mdc")}stale\n`);
+      }
+      if (action === "delete") {
+        writeFileSync(
+          join(root, ".agents", "config.yaml"),
+          `version: 1
+adapters:
+  agents: true
+  claude: true
+  cursor: false
+  copilot: true
+`,
+        );
+      }
+
+      const originalGithubPath = join(root, ".github");
+      const movedGithubPath = join(root, ".github-original");
+      const outside = temporaryDirectory(t, `agent-guidance-${action}-unsafe-parent-`);
+      writeFileSync(join(outside, "copilot-instructions.md"), "outside\n");
+      const script = `
+import fs from "node:fs";
+import { syncBuiltinESMExports } from "node:module";
+import { basename } from "node:path";
+
+const root = ${JSON.stringify(root)};
+const action = ${JSON.stringify(action)};
+const originalGithubPath = ${JSON.stringify(originalGithubPath)};
+const movedGithubPath = ${JSON.stringify(movedGithubPath)};
+const outside = ${JSON.stringify(outside)};
+const originalLinkSync = fs.linkSync;
+const originalRenameSync = fs.renameSync;
+const originalRmSync = fs.rmSync;
+let swapped = false;
+const replaceGithubParent = () => {
+  if (swapped) return;
+  fs.renameSync(originalGithubPath, movedGithubPath);
+  fs.symlinkSync(outside, originalGithubPath, "dir");
+  swapped = true;
+};
+fs.linkSync = (source, destination) => {
+  const result = originalLinkSync(source, destination);
+  if (action === "create" && basename(destination) === "CLAUDE.md") replaceGithubParent();
+  return result;
+};
+fs.renameSync = (source, destination) => {
+  const result = originalRenameSync(source, destination);
+  if (action === "update" && basename(destination) === "agent-guidance.mdc") {
+    replaceGithubParent();
+  }
+  return result;
+};
+fs.rmSync = (path, options) => {
+  const result = originalRmSync(path, options);
+  if (action === "delete" && basename(path) === "agent-guidance.mdc") {
+    replaceGithubParent();
+  }
+  return result;
+};
+syncBuiltinESMExports();
+
+const { syncProject } = await import(${JSON.stringify(pathToFileURL(join(packageRoot, "src", "index.mjs")).href)});
+let failure = null;
+try {
+  syncProject(root);
+} catch (error) {
+  failure = error;
+}
+if (!swapped) throw new Error("The unchanged target parent was not replaced.");
+if (!failure) throw new Error("Synchronization accepted an unsafe unchanged-target parent.");
+const failureMessages = [];
+for (let current = failure; current; current = current.cause) failureMessages.push(current.message);
+if (!failureMessages.some((message) => /generated path traverses a symlink: \.github/.test(message))) {
+  throw failure;
+}
+`;
+      const result = spawnSync(process.execPath, ["--input-type=module", "--eval", script], {
+        encoding: "utf8",
+      });
+
+      assert.equal(result.status, 0, `${action}: ${result.stderr}`);
+      assert.equal(readFileSync(join(outside, "copilot-instructions.md"), "utf8"), "outside\n");
+      assert.ok(lstatIfExists(join(movedGithubPath, "copilot-instructions.md")));
+      const check = runCli(root, "check");
+      assert.equal(check.status, 1, `${action}: ${check.stderr}`);
+      assert.equal(listFiles(root).some((path) => path.endsWith(".tmp")), false);
+    }
+  },
+);
+
+test(
+  "deletes obsolete outputs through their verified parent directory",
+  { skip: process.platform === "win32" },
+  (t) => {
+    const root = temporaryDirectory(t);
+    cpSync(join(scopedFixtureRoot, ".agents"), join(root, ".agents"), { recursive: true });
+    assert.equal(runCli(root, "sync").status, 0);
+    rmSync(join(root, ".agents", "rules", "frontend", "react.md"));
+
+    const targetParent = join(root, ".cursor", "rules", "agent-guidance", "frontend");
+    const movedTargetParent = join(
+      root,
+      ".cursor",
+      "rules",
+      "agent-guidance",
+      "frontend-original",
+    );
+    const outside = temporaryDirectory(t, "agent-guidance-delete-parent-outside-");
+    writeFileSync(join(outside, "react.mdc"), "outside\n");
+
+    const script = `
+import fs from "node:fs";
+import { syncBuiltinESMExports } from "node:module";
+import { basename, join } from "node:path";
+
+const root = ${JSON.stringify(root)};
+const targetParent = ${JSON.stringify(targetParent)};
+const movedTargetParent = ${JSON.stringify(movedTargetParent)};
+const outside = ${JSON.stringify(outside)};
+const originalRmSync = fs.rmSync;
+let swapped = false;
+fs.rmSync = (path, options) => {
+  if (!swapped && typeof path === "string" && basename(path) === "react.mdc") {
+    fs.renameSync(targetParent, movedTargetParent);
+    fs.symlinkSync(outside, targetParent, "dir");
+    swapped = true;
+  }
+  const result = originalRmSync(path, options);
+  if (!fs.existsSync(join(outside, "react.mdc"))) {
+    process.stdout.write("external-output-deleted\\n");
+  }
+  return result;
+};
+syncBuiltinESMExports();
+
+const { syncProject } = await import(${JSON.stringify(pathToFileURL(join(packageRoot, "src", "index.mjs")).href)});
+let failure = null;
+try {
+  syncProject(root);
+} catch (error) {
+  failure = error;
+}
+if (!swapped) throw new Error("The deletion substitution was not injected.");
+if (!failure) throw new Error("Synchronization accepted an unsafe enabled namespace.");
+const failureMessages = [];
+for (let current = failure; current; current = current.cause) failureMessages.push(current.message);
+if (!failureMessages.some((message) => /generated path traverses a symlink/.test(message))) {
+  throw failure;
+}
+`;
+    const result = spawnSync(process.execPath, ["--input-type=module", "--eval", script], {
+      encoding: "utf8",
+    });
+
+    assert.equal(result.status, 0, result.stderr);
+    assert.doesNotMatch(result.stdout, /external-output-deleted/);
+    assert.equal(readFileSync(join(outside, "react.mdc"), "utf8"), "outside\n");
+    assert.deepEqual(listFiles(movedTargetParent), []);
+    assert.equal(runCli(root, "check").status, 1);
+    assert.equal(listFiles(root).some((path) => path.endsWith(".tmp")), false);
+  },
+);
+
+test(
+  "pins the deletion ancestor chain before a real-directory substitution",
+  { skip: process.platform === "win32" },
+  (t) => {
+    const root = temporaryDirectory(t);
+    cpSync(join(scopedFixtureRoot, ".agents"), join(root, ".agents"), { recursive: true });
+    assert.equal(runCli(root, "sync").status, 0);
+    rmSync(join(root, ".agents", "rules", "frontend", "react.md"));
+
+    const cursorPath = join(root, ".cursor");
+    const movedCursorPath = join(root, ".cursor-original");
+    const replacementCursorPath = join(root, ".cursor-replacement");
+    const targetRelativePath = join("rules", "agent-guidance", "frontend", "react.mdc");
+    const targetPath = join(cursorPath, targetRelativePath);
+    const targetParent = dirname(targetPath);
+    const inspectedParent = dirname(targetParent);
+    const realInspectedParent = realpathSync(inspectedParent);
+    const replacementTargetPath = join(replacementCursorPath, targetRelativePath);
+    mkdirSync(dirname(replacementTargetPath), { recursive: true });
+    const linked = spawnSync("ln", [targetPath, replacementTargetPath], { encoding: "utf8" });
+    if (linked.status !== 0) {
+      t.skip(`hard links are unavailable: ${linked.stderr}`);
+      return;
+    }
+
+    const script = `
+import fs from "node:fs";
+import { syncBuiltinESMExports } from "node:module";
+
+const root = ${JSON.stringify(root)};
+const cursorPath = ${JSON.stringify(cursorPath)};
+const movedCursorPath = ${JSON.stringify(movedCursorPath)};
+const replacementCursorPath = ${JSON.stringify(replacementCursorPath)};
+const targetParent = ${JSON.stringify(targetParent)};
+const realInspectedParent = ${JSON.stringify(realInspectedParent)};
+const originalChdir = process.chdir;
+const originalLstatSync = fs.lstatSync;
+let swapped = false;
+const swap = () => {
+  if (swapped) return;
+  fs.renameSync(cursorPath, movedCursorPath);
+  fs.renameSync(replacementCursorPath, cursorPath);
+  swapped = true;
+};
+fs.lstatSync = (path, options) => {
+  const stack = new Error().stack ?? "";
+  if (!swapped && path === targetParent && stack.includes("commitDeletion")) swap();
+  return originalLstatSync(path, options);
+};
+process.chdir = (path) => {
+  const current = process.cwd();
+  const stack = new Error().stack ?? "";
+  const result = originalChdir(path);
+  if (
+    !swapped &&
+    current === realInspectedParent &&
+    stack.includes("commitDeletion")
+  ) {
+    swap();
+  }
+  return result;
+};
+syncBuiltinESMExports();
+
+const { syncProject } = await import(${JSON.stringify(pathToFileURL(join(packageRoot, "src", "index.mjs")).href)});
+let failure = null;
+try {
+  syncProject(root);
+} catch (error) {
+  failure = error;
+}
+if (!swapped) throw new Error("The deletion ancestor substitution was not injected.");
+if (!failure) throw new Error("Synchronization accepted a replacement deletion ancestor.");
+const failureMessages = [];
+for (let current = failure; current; current = current.cause) failureMessages.push(current.message);
+if (!failureMessages.some((message) => /parent directory changed before deletion/.test(message))) {
+  throw failure;
+}
+`;
+    const result = spawnSync(process.execPath, ["--input-type=module", "--eval", script], {
+      encoding: "utf8",
+    });
+
+    assert.equal(result.status, 0, result.stderr);
+    assert.ok(lstatIfExists(join(cursorPath, targetRelativePath)));
+    assert.ok(lstatIfExists(join(movedCursorPath, targetRelativePath)));
+    assert.equal(listFiles(root).some((path) => path.endsWith(".tmp")), false);
+  },
+);
+
+test(
+  "prunes obsolete output directories only through verified ancestors",
+  { skip: process.platform === "win32" },
+  (t) => {
+    const root = temporaryDirectory(t);
+    cpSync(join(scopedFixtureRoot, ".agents"), join(root, ".agents"), { recursive: true });
+    assert.equal(runCli(root, "sync").status, 0);
+    rmSync(join(root, ".agents", "rules", "frontend", "react.md"));
+
+    const cursorPath = join(root, ".cursor");
+    const movedCursorPath = join(root, ".cursor-original");
+    const outside = temporaryDirectory(t, "agent-guidance-prune-outside-");
+    const outsideFrontend = join(outside, "rules", "agent-guidance", "frontend");
+    mkdirSync(outsideFrontend, { recursive: true });
+
+    const script = `
+import fs from "node:fs";
+import { syncBuiltinESMExports } from "node:module";
+import { basename } from "node:path";
+
+const root = ${JSON.stringify(root)};
+const cursorPath = ${JSON.stringify(cursorPath)};
+const movedCursorPath = ${JSON.stringify(movedCursorPath)};
+const outside = ${JSON.stringify(outside)};
+const originalRmSync = fs.rmSync;
+let swapped = false;
+fs.rmSync = (path, options) => {
+  const result = originalRmSync(path, options);
+  if (!swapped && typeof path === "string" && basename(path) === "react.mdc") {
+    fs.renameSync(cursorPath, movedCursorPath);
+    fs.symlinkSync(outside, cursorPath, "dir");
+    swapped = true;
+  }
+  return result;
+};
+syncBuiltinESMExports();
+
+const { syncProject } = await import(${JSON.stringify(pathToFileURL(join(packageRoot, "src", "index.mjs")).href)});
+let failure = null;
+try {
+  syncProject(root);
+} catch (error) {
+  failure = error;
+}
+if (!swapped) throw new Error("The pruning ancestor substitution was not injected.");
+if (!failure) throw new Error("Synchronization accepted the replaced generated ancestor.");
+const failureMessages = [];
+for (let current = failure; current; current = current.cause) failureMessages.push(current.message);
+if (!failureMessages.some((message) => /generated path traverses a symlink: \.cursor/.test(message))) {
+  throw failure;
+}
+`;
+    const result = spawnSync(process.execPath, ["--input-type=module", "--eval", script], {
+      encoding: "utf8",
+    });
+
+    assert.equal(result.status, 0, result.stderr);
+    assert.equal(lstatSync(outsideFrontend).isDirectory(), true);
+    assert.equal(
+      lstatSync(join(movedCursorPath, "rules", "agent-guidance", "frontend")).isDirectory(),
+      true,
+    );
+    assert.equal(listFiles(root).some((path) => path.endsWith(".tmp")), false);
+  },
+);
+
+test(
+  "cleans created directories only through verified ancestors",
+  { skip: process.platform === "win32" },
+  (t) => {
+    const root = temporaryRepo(t);
+    const cursorPath = join(root, ".cursor");
+    const movedCursorPath = join(root, ".cursor-original");
+    const outside = temporaryDirectory(t, "agent-guidance-cleanup-outside-");
+    const outsideRules = join(outside, "rules");
+    mkdirSync(outsideRules);
+
+    const script = `
+import fs from "node:fs";
+import { syncBuiltinESMExports } from "node:module";
+import { basename } from "node:path";
+
+const root = ${JSON.stringify(root)};
+const cursorPath = ${JSON.stringify(cursorPath)};
+const movedCursorPath = ${JSON.stringify(movedCursorPath)};
+const outside = ${JSON.stringify(outside)};
+const originalOpenSync = fs.openSync;
+const originalRmdirSync = fs.rmdirSync;
+let failedStaging = false;
+let swapped = false;
+fs.openSync = (path, flags, mode) => {
+  if (
+    !failedStaging &&
+    typeof path === "string" &&
+    basename(path).startsWith(".copilot-instructions.md.") &&
+    path.endsWith(".tmp")
+  ) {
+    failedStaging = true;
+    const error = new Error("Injected staging failure.");
+    error.code = "EACCES";
+    throw error;
+  }
+  return originalOpenSync(path, flags, mode);
+};
+fs.rmdirSync = (path) => {
+  if (!swapped && typeof path === "string" && basename(path) === ".github") {
+    fs.renameSync(cursorPath, movedCursorPath);
+    fs.symlinkSync(outside, cursorPath, "dir");
+    swapped = true;
+  }
+  return originalRmdirSync(path);
+};
+syncBuiltinESMExports();
+
+const { syncProject } = await import(${JSON.stringify(pathToFileURL(join(packageRoot, "src", "index.mjs")).href)});
+let failure = null;
+try {
+  syncProject(root);
+} catch (error) {
+  failure = error;
+}
+if (!failedStaging) throw new Error("The staging failure was not injected.");
+if (!swapped) throw new Error("The cleanup ancestor substitution was not injected.");
+const failureMessages = [];
+for (let current = failure; current; current = current.cause) failureMessages.push(current.message);
+if (!failureMessages.some((message) => /Could not stage atomic write/.test(message))) throw failure;
+`;
+    const result = spawnSync(process.execPath, ["--input-type=module", "--eval", script], {
+      encoding: "utf8",
+    });
+
+    assert.equal(result.status, 0, result.stderr);
+    assert.equal(lstatSync(outsideRules).isDirectory(), true);
+    assert.equal(lstatSync(join(movedCursorPath, "rules")).isDirectory(), true);
+    assert.equal(listFiles(outside).some((path) => path.endsWith(".tmp")), false);
+  },
+);
+
+test(
+  "does not publish earlier targets when a later write cannot be staged",
+  { skip: process.platform === "win32" || process.getuid?.() === 0 },
+  (t) => {
+    const root = temporaryRepo(t);
+    const unwritableDirectory = join(root, ".github");
+    mkdirSync(unwritableDirectory);
+    chmodSync(unwritableDirectory, 0o555);
+
+    let sync;
+    try {
+      sync = runCli(root, "sync");
+    } finally {
+      chmodSync(unwritableDirectory, 0o755);
+    }
+
+    assert.equal(sync.status, 1);
+    assert.match(sync.stderr, /Could not stage atomic write for \.github\/copilot-instructions\.md/);
+    for (const relativePath of generatedPaths) {
+      assert.equal(lstatIfExists(join(root, relativePath)), null);
+    }
+    assert.equal(lstatIfExists(join(root, ".cursor")), null);
+    assert.equal(listFiles(root).some((path) => path.endsWith(".tmp")), false);
+  },
+);
+
+test(
+  "does not replace a symlink created while a missing target is staged",
+  async (t) => {
+    const root = temporaryRepo(t);
+    const outside = join(temporaryDirectory(t, "agent-guidance-race-"), "sentinel.md");
+    writeFileSync(outside, "outside\n");
+    const probePath = join(root, ".agent-guidance-symlink-probe");
+    if (!createSymlinkOrSkip(t, outside, probePath, "file")) return;
+    rmSync(probePath);
+    writeFileSync(
+      join(root, ".agents", "guide.md"),
+      `# Large race fixture\n\n${"x".repeat(8 * 1024 * 1024)}\n`,
+    );
+
+    const { child, completed } = runCliAsync(root, "sync");
+    const deadline = Date.now() + 10_000;
+    let injected = false;
+    while (child.exitCode === null && Date.now() < deadline) {
+      const temporaryAgentFile = readdirSync(root).find(
+        (entry) => entry.startsWith(".AGENTS.md.") && entry.endsWith(".tmp"),
+      );
+      if (temporaryAgentFile) {
+        symlinkSync(outside, join(root, "AGENTS.md"), "file");
+        injected = true;
+        break;
+      }
+      await delay(1);
+    }
+
+    const sync = await completed;
+    assert.equal(injected, true, `Could not intercept staged write; stderr: ${sync.stderr}`);
+    assert.equal(sync.status, 1);
+    assert.equal(lstatSync(join(root, "AGENTS.md")).isSymbolicLink(), true);
+    assert.equal(readFileSync(outside, "utf8"), "outside\n");
+    assert.equal(lstatIfExists(join(root, "CLAUDE.md")), null);
+    assert.equal(listFiles(root).some((path) => path.endsWith(".tmp")), false);
+  },
+);
+
+test(
+  "preserves POSIX mode bits when atomically updating an owned file",
+  { skip: process.platform === "win32" },
+  (t) => {
+    const root = temporaryRepo(t);
+    assert.equal(runCli(root, "sync").status, 0);
+    const agentsPath = join(root, "AGENTS.md");
+    chmodSync(agentsPath, 0o640);
+    writeFileSync(join(root, ".agents", "guide.md"), "# Updated guide\n");
+
+    const sync = runCli(root, "sync");
+    assert.equal(sync.status, 0, sync.stderr);
+    assert.equal(statSync(agentsPath).mode & 0o777, 0o640);
+    assert.equal(listFiles(root).some((path) => path.endsWith(".tmp")), false);
+  },
+);
+
+test(
+  "preserves POSIX mode bits despite a restrictive process umask",
+  { skip: process.platform === "win32" },
+  (t) => {
+    const root = temporaryRepo(t);
+    assert.equal(runCli(root, "sync").status, 0);
+    const agentsPath = join(root, "AGENTS.md");
+    chmodSync(agentsPath, 0o664);
+    writeFileSync(join(root, ".agents", "guide.md"), "# Updated under restrictive umask\n");
+
+    const previousUmask = process.umask(0o077);
+    let sync;
+    try {
+      sync = runCli(root, "sync");
+    } finally {
+      process.umask(previousUmask);
+    }
+
+    assert.equal(sync.status, 0, sync.stderr);
+    assert.equal(statSync(agentsPath).mode & 0o777, 0o664);
+  },
+);
+
+test("finds the nearest canonical source from a descendant directory", (t) => {
+  const root = temporaryRepo(t);
+  const nested = join(root, "packages", "app", "src");
+  mkdirSync(nested, { recursive: true });
+
+  const sync = runCli(nested, "sync");
+  assert.equal(sync.status, 0, sync.stderr);
+  assert.equal(read(root, "AGENTS.md"), read(expectedRoot, "AGENTS.md"));
+  assert.equal(lstatIfExists(join(nested, "AGENTS.md")), null);
+});
+
+test("does not climb past a nested Git repository boundary", (t) => {
+  const parentRoot = temporaryRepo(t);
+  const nestedRepo = join(parentRoot, "nested-repository");
+  const nestedDirectory = join(nestedRepo, "packages", "app");
+  mkdirSync(join(nestedRepo, ".git"), { recursive: true });
+  mkdirSync(nestedDirectory, { recursive: true });
+
+  const sync = runCli(nestedDirectory, "sync");
+  assert.equal(sync.status, 1);
+  assert.match(sync.stderr, /Git repository boundary/);
+  assert.equal(lstatIfExists(join(parentRoot, "AGENTS.md")), null);
+  assert.equal(lstatIfExists(join(nestedRepo, "AGENTS.md")), null);
+});
+
+test(
+  "rejects a symlinked canonical source in check and force modes",
+  (t) => {
+    const root = temporaryRepo(t);
+    const sourcePath = join(root, ".agents", "guide.md");
+    const outside = join(temporaryDirectory(t, "agent-guidance-source-"), "guide.md");
+    writeFileSync(outside, "# Outside guidance\n");
+    rmSync(sourcePath);
+    if (!createSymlinkOrSkip(t, outside, sourcePath, "file")) return;
+
+    for (const command of [["check"], ["sync", "--force"]]) {
+      const result = runCli(root, ...command);
+      assert.equal(result.status, 1);
+      assert.match(result.stderr, /Canonical source must not be a symlink/);
+    }
+    assert.equal(readFileSync(outside, "utf8"), "# Outside guidance\n");
+    assert.equal(lstatIfExists(join(root, "AGENTS.md")), null);
+  },
+);
+
+test("rejects non-regular targets even in force mode", (t) => {
+  const root = temporaryRepo(t);
+  mkdirSync(join(root, "AGENTS.md"));
+
+  const sync = runCli(root, "sync", "--force");
+  assert.equal(sync.status, 1);
+  assert.match(sync.stderr, /unsafe: AGENTS\.md .*not a regular file/);
+  assert.equal(lstatSync(join(root, "AGENTS.md")).isDirectory(), true);
+  assert.equal(lstatIfExists(join(root, "CLAUDE.md")), null);
+});
+
+test("supports guidance larger than the former Copilot instruction limit", (t) => {
+  const root = temporaryRepo(t);
+  const marker = "x".repeat(4_100);
+  writeFileSync(join(root, ".agents", "guide.md"), `# Large guide\n\n${marker}\n`);
+
+  const sync = runCli(root, "sync");
+  assert.equal(sync.status, 0, sync.stderr);
+  assert.ok(read(root, "AGENTS.md").length > 4_000);
+  assert.ok(read(root, ".cursor/rules/agent-guidance.mdc").includes(marker));
+  assert.ok(read(root, ".github/copilot-instructions.md").includes(marker));
+  assert.equal(runCli(root, "check").status, 0);
+});
+
+test("reports missing sources and invalid CLI combinations without writing", (t) => {
+  const root = temporaryDirectory(t);
+
+  const missing = runCli(root, "check");
+  assert.equal(missing.status, 1);
+  assert.match(missing.stderr, /Could not find \.agents\/guide\.md/);
+
+  const invalid = runCli(root, "sync", "--adopt", "--force");
+  assert.equal(invalid.status, 2);
+  assert.match(invalid.stderr, /mutually exclusive/);
+
+  const maskedInvalid = runCli(root, "sync", "--unknown", "--help");
+  assert.equal(maskedInvalid.status, 2);
+  assert.match(maskedInvalid.stderr, /--help cannot be combined/);
+
+  const duplicate = runCli(root, "sync", "--adopt", "--adopt");
+  assert.equal(duplicate.status, 2);
+  assert.match(duplicate.stderr, /Duplicate option: --adopt/);
+
+  const unknownOption = runCli(root, "sync", "--unknown");
+  assert.equal(unknownOption.status, 2);
+  assert.match(unknownOption.stderr, /Unknown option: --unknown/);
+
+  const unknownCommand = runCli(root, "unknown", "--json");
+  assert.equal(unknownCommand.status, 2);
+  const unknownCommandError = JSON.parse(unknownCommand.stderr);
+  assert.equal(unknownCommandError.command, null);
+  assert.equal(unknownCommandError.error.message, "Unknown command: unknown");
+
+  const invalidInit = runCli(root, "init", "--force");
+  assert.equal(invalidInit.status, 2);
+  assert.match(invalidInit.stderr, /init does not accept --adopt or --force/);
+
+  const invalidInitDryRun = runCli(root, "init", "--dry-run");
+  assert.equal(invalidInitDryRun.status, 2);
+  assert.match(invalidInitDryRun.stderr, /init does not accept --dry-run/);
+
+  const invalidCheckDryRun = runCli(root, "check", "--dry-run");
+  assert.equal(invalidCheckDryRun.status, 2);
+  assert.match(invalidCheckDryRun.stderr, /check does not accept --dry-run/);
+
+  const duplicateJson = runCli(root, "check", "--json", "--json");
+  assert.equal(duplicateJson.status, 2);
+  assert.equal(JSON.parse(duplicateJson.stderr).error.message, "Duplicate option: --json");
+
+  const commandHelp = runCli(root, "sync", "--help");
+  assert.equal(commandHelp.status, 0, commandHelp.stderr);
+  assert.match(commandHelp.stdout, /missing, stale, obsolete, unmanaged, or unsafe/);
+  assert.match(commandHelp.stdout, /--dry-run/);
+  assert.match(commandHelp.stdout, /--json/);
+  assert.match(commandHelp.stdout, /outside reserved namespaces/);
+
+  const initHelp = runCli(root, "init", "--help");
+  assert.equal(initHelp.status, 0, initHelp.stderr);
+  assert.match(initHelp.stdout, /without overwriting existing files/);
+  assert.deepEqual(listFiles(root), []);
+});
+
+test("reports the package metadata version", () => {
+  assert.equal(packageMetadata.scripts.check, "node bin/agent-guidance.mjs check");
+  const version = runCli(packageRoot, "--version");
+  assert.equal(version.status, 0, version.stderr);
+  assert.equal(version.stdout, `${packageMetadata.version}\n`);
+});
+
+test("packs, installs, and runs the published artifact", (t) => {
+  const artifactRoot = temporaryDirectory(t, "agent-guidance-artifact-");
+  const consumerRoot = temporaryDirectory(t, "agent-guidance-consumer-");
+  const npmCache = join(artifactRoot, "npm-cache");
+  const npmCommand = process.platform === "win32" ? "npm.cmd" : "npm";
+  const npmEnvironment = { ...process.env, npm_config_cache: npmCache };
+
+  const pack = spawnSync(
+    npmCommand,
+    ["pack", "--json", "--pack-destination", artifactRoot],
+    {
+      cwd: packageRoot,
+      encoding: "utf8",
+      env: npmEnvironment,
+      shell: process.platform === "win32",
+    },
+  );
+  assert.equal(pack.status, 0, pack.stderr);
+  const [{ filename }] = JSON.parse(pack.stdout);
+  const tarballPath = join(artifactRoot, filename);
+  writeFileSync(join(consumerRoot, "package.json"), '{"private":true}\n');
+
+  const install = spawnSync(
+    npmCommand,
+    ["install", "--ignore-scripts", "--no-audit", "--no-fund", "--save=false", tarballPath],
+    {
+      cwd: consumerRoot,
+      encoding: "utf8",
+      env: npmEnvironment,
+      shell: process.platform === "win32",
+    },
+  );
+  assert.equal(install.status, 0, install.stderr);
+
+  const installedCli = join(
+    consumerRoot,
+    "node_modules",
+    "@martinmqz",
+    "agent-guidance-sync",
+    "bin",
+    "agent-guidance.mjs",
+  );
+  const installedBin = join(
+    consumerRoot,
+    "node_modules",
+    ".bin",
+    process.platform === "win32" ? "agent-guidance.cmd" : "agent-guidance",
+  );
+  assert.ok(lstatIfExists(installedBin));
+  const version = spawnSync(process.execPath, [installedCli, "--version"], {
+    cwd: consumerRoot,
+    encoding: "utf8",
+  });
+  assert.equal(version.status, 0, version.stderr);
+  assert.equal(version.stdout, `${packageMetadata.version}\n`);
+
+  const init = spawnSync(process.execPath, [installedCli, "init", "--json"], {
+    cwd: consumerRoot,
+    encoding: "utf8",
+  });
+  assert.equal(init.status, 0, init.stderr);
+  assert.equal(JSON.parse(init.stdout).status, "initialized");
+  assert.equal(read(consumerRoot, ".agents/guide.md"), INITIAL_GUIDE);
+  assert.equal(read(consumerRoot, ".agents/config.yaml"), INITIAL_CONFIG);
+
+  const preview = spawnSync(
+    process.execPath,
+    [installedCli, "sync", "--dry-run", "--json"],
+    {
+      cwd: consumerRoot,
+      encoding: "utf8",
+    },
+  );
+  assert.equal(preview.status, 0, preview.stderr);
+  assert.equal(JSON.parse(preview.stdout).status, "changes-planned");
+  assert.equal(lstatIfExists(join(consumerRoot, "AGENTS.md")), null);
+
+  const sync = spawnSync(process.execPath, [installedCli, "sync", "--json"], {
+    cwd: consumerRoot,
+    encoding: "utf8",
+  });
+  assert.equal(sync.status, 0, sync.stderr);
+  assert.equal(JSON.parse(sync.stdout).status, "synced");
+  for (const relativePath of generatedPaths) {
+    assert.ok(lstatIfExists(join(consumerRoot, relativePath)));
+  }
+
+  const check = spawnSync(process.execPath, [installedCli, "check", "--json"], {
+    cwd: consumerRoot,
+    encoding: "utf8",
+  });
+  assert.equal(check.status, 0, check.stderr);
+  assert.equal(JSON.parse(check.stdout).status, "in-sync");
+});
+
+function lstatIfExists(path) {
+  try {
+    return lstatSync(path);
+  } catch (error) {
+    if (error && typeof error === "object" && error.code === "ENOENT") return null;
+    throw error;
+  }
+}
