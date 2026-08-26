@@ -1,0 +1,104 @@
+name: Publish
+
+on:
+  release:
+    types: [published]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: publish-${{ github.event.release.tag_name }}
+  cancel-in-progress: false
+
+jobs:
+  guard:
+    if: github.event.release.prerelease == false
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+
+      - name: Set up Node.js
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: 24
+          package-manager-cache: false
+
+      - name: Verify release source and version
+        run: |
+          if git merge-base --is-ancestor "$GITHUB_SHA" origin/main; then
+            echo "Release commit $GITHUB_SHA is on main."
+          else
+            status=$?
+            if [ "$status" -eq 1 ]; then
+              echo "Release commit $GITHUB_SHA is not on main." >&2
+            else
+              echo "Could not verify release commit $GITHUB_SHA against origin/main." >&2
+            fi
+            exit "$status"
+          fi
+          node -e 'const { readFileSync } = require("node:fs"); const { version } = JSON.parse(readFileSync("package.json", "utf8")); const tag = process.env.GITHUB_REF_NAME; if (version.includes("-")) throw new Error(`Prerelease package version ${version} is not supported by the stable publish workflow.`); if (tag !== `v${version}`) throw new Error(`Release tag ${tag} must match package version ${version}.`);'
+
+  verify:
+    needs: guard
+    permissions:
+      contents: read
+    uses: ./.github/workflows/ci.yml
+
+  bootstrap:
+    needs: verify
+    if: github.ref_name == 'v0.1.0'
+    permissions:
+      contents: read
+      id-token: write
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Set up Node.js and npm registry
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: 24
+          registry-url: https://registry.npmjs.org/
+          package-manager-cache: false
+
+      - name: Publish first version with bootstrap token
+        run: |
+          if [ -z "$NODE_AUTH_TOKEN" ]; then
+            echo "NPM_BOOTSTRAP_TOKEN is required for the first publish." >&2
+            exit 1
+          fi
+          npm publish
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_BOOTSTRAP_TOKEN }}
+
+  publish:
+    needs: verify
+    if: github.ref_name != 'v0.1.0'
+    permissions:
+      contents: read
+      id-token: write
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Set up Node.js and npm registry
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: 24
+          registry-url: https://registry.npmjs.org/
+          package-manager-cache: false
+
+      - name: Publish with npm trusted publishing
+        run: npm publish
