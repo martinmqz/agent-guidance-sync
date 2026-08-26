@@ -1579,6 +1579,134 @@ test(
 );
 
 test(
+  "aborts planning when the verified project root is replaced",
+  { skip: process.platform === "win32" },
+  (t) => {
+    const container = temporaryDirectory(t);
+    const root = join(container, "repo");
+    const movedRoot = join(container, "repo-original");
+    const replacementRoot = join(container, "repo-replacement");
+    cpSync(join(fixtureRoot, ".agents"), join(root, ".agents"), { recursive: true });
+    cpSync(join(fixtureRoot, ".agents"), join(replacementRoot, ".agents"), {
+      recursive: true,
+    });
+    const originalFiles = snapshotFiles(root);
+    const replacementFiles = snapshotFiles(replacementRoot);
+
+    const script = `
+import fs from "node:fs";
+import { syncBuiltinESMExports } from "node:module";
+
+const root = ${JSON.stringify(root)};
+const movedRoot = ${JSON.stringify(movedRoot)};
+const replacementRoot = ${JSON.stringify(replacementRoot)};
+const originalLstatSync = fs.lstatSync;
+let rootStatReads = 0;
+let swapped = false;
+fs.lstatSync = (path, options) => {
+  const stats = originalLstatSync(path, options);
+  if (!swapped && path === root) {
+    rootStatReads += 1;
+    if (rootStatReads === 2) {
+      fs.renameSync(root, movedRoot);
+      fs.renameSync(replacementRoot, root);
+      swapped = true;
+    }
+  }
+  return stats;
+};
+syncBuiltinESMExports();
+
+const { syncProject } = await import(${JSON.stringify(pathToFileURL(join(packageRoot, "src", "index.mjs")).href)});
+let failure = null;
+try {
+  syncProject(root);
+} catch (error) {
+  failure = error;
+}
+if (!swapped) throw new Error("The project-root substitution was not injected during planning.");
+if (!failure) throw new Error("Synchronization accepted a replacement project root.");
+const failureMessages = [];
+for (let current = failure; current; current = current.cause) failureMessages.push(current.message);
+if (!failureMessages.some((message) => /Project root changed while guidance was being planned/.test(message))) {
+  throw failure;
+}
+`;
+    const result = spawnSync(process.execPath, ["--input-type=module", "--eval", script], {
+      encoding: "utf8",
+    });
+
+    assert.equal(result.status, 0, result.stderr);
+    assert.deepEqual(snapshotFiles(movedRoot), originalFiles);
+    assert.deepEqual(snapshotFiles(root), replacementFiles);
+  },
+);
+
+test(
+  "never stages generated files after the verified project root is replaced",
+  { skip: process.platform === "win32" },
+  (t) => {
+    const container = temporaryDirectory(t);
+    const root = join(container, "repo");
+    const movedRoot = join(container, "repo-original");
+    const replacementRoot = join(container, "repo-replacement");
+    cpSync(join(fixtureRoot, ".agents"), join(root, ".agents"), { recursive: true });
+    cpSync(join(fixtureRoot, ".agents"), join(replacementRoot, ".agents"), {
+      recursive: true,
+    });
+    const originalFiles = snapshotFiles(root);
+    const replacementFiles = snapshotFiles(replacementRoot);
+
+    const script = `
+import fs from "node:fs";
+import { syncBuiltinESMExports } from "node:module";
+
+const root = ${JSON.stringify(root)};
+const movedRoot = ${JSON.stringify(movedRoot)};
+const replacementRoot = ${JSON.stringify(replacementRoot)};
+const originalOpenSync = fs.openSync;
+let swapped = false;
+fs.openSync = (path, flags, mode) => {
+  if (
+    !swapped &&
+    typeof path === "string" &&
+    path.startsWith(".AGENTS.md.") &&
+    path.endsWith(".tmp")
+  ) {
+    fs.renameSync(root, movedRoot);
+    fs.renameSync(replacementRoot, root);
+    swapped = true;
+  }
+  return originalOpenSync(path, flags, mode);
+};
+syncBuiltinESMExports();
+
+const { syncProject } = await import(${JSON.stringify(pathToFileURL(join(packageRoot, "src", "index.mjs")).href)});
+let failure = null;
+try {
+  syncProject(root);
+} catch (error) {
+  failure = error;
+}
+if (!swapped) throw new Error("The project-root substitution was not injected during staging.");
+if (!failure) throw new Error("Synchronization staged through a replacement project root.");
+const failureMessages = [];
+for (let current = failure; current; current = current.cause) failureMessages.push(current.message);
+if (!failureMessages.some((message) => /Project root changed while guidance was being staged/.test(message))) {
+  throw failure;
+}
+`;
+    const result = spawnSync(process.execPath, ["--input-type=module", "--eval", script], {
+      encoding: "utf8",
+    });
+
+    assert.equal(result.status, 0, result.stderr);
+    assert.deepEqual(snapshotFiles(movedRoot), originalFiles);
+    assert.deepEqual(snapshotFiles(root), replacementFiles);
+  },
+);
+
+test(
   "does not create parent directories through a symlink introduced during staging",
   async (t) => {
     const root = temporaryRepo(t);

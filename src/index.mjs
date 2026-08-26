@@ -93,6 +93,17 @@ function hasSameFileIdentity(left, right) {
   return Boolean(left && right && left.dev === right.dev && left.ino === right.ino);
 }
 
+function assertProjectRootUnchanged(root, expectedStats, operation) {
+  const current = lstatIfExists(root);
+  if (
+    !current?.isDirectory() ||
+    current.isSymbolicLink() ||
+    !hasSameFileIdentity(current, expectedStats)
+  ) {
+    throw new GuidanceError(`Project root changed ${operation}: ${root}`);
+  }
+}
+
 function withStableDirectory(path, expectedStats, changedMessage, operation) {
   const previousDirectory = process.cwd();
   try {
@@ -912,11 +923,11 @@ function removeCreatedDirectories(createdDirectories) {
   }
 }
 
-function ensureTargetParentDirectories(root, targetPath) {
+function ensureTargetParentDirectories(root, targetPath, rootIdentity) {
   const createdDirectories = [];
   const segments = dirname(targetPath).split("/").filter((segment) => segment !== ".");
   let current = root;
-  let currentStats = lstatIfExists(current);
+  let currentStats = rootIdentity;
   if (!currentStats?.isDirectory() || currentStats.isSymbolicLink()) {
     throw new GuidanceError(`Project root changed while creating generated directories: ${root}`);
   }
@@ -1389,6 +1400,20 @@ function renderCanonicalTargets(root) {
   });
 }
 
+function planProjectWithRootIdentity(projectRoot, rootStats, takeover) {
+  assertProjectRootUnchanged(projectRoot, rootStats, "while guidance was being planned");
+  const targets = renderCanonicalTargets(projectRoot);
+  assertProjectRootUnchanged(projectRoot, rootStats, "while guidance was being planned");
+  const expectedPaths = new Set(targets.map(({ relativePath }) => relativePath));
+  const plan = [
+    ...targets.map((target) => classifyTarget(projectRoot, target, takeover)),
+    ...classifyDisabledOwnedTargets(projectRoot, expectedPaths),
+    ...classifyManagedRuleNamespaces(projectRoot, expectedPaths),
+  ];
+  assertProjectRootUnchanged(projectRoot, rootStats, "while guidance was being planned");
+  return plan;
+}
+
 export function planProject(root, { takeover = "none" } = {}) {
   if (!["none", "adopt", "force"].includes(takeover)) {
     throw new GuidanceError(`Unsupported takeover mode: ${takeover}`);
@@ -1398,13 +1423,7 @@ export function planProject(root, { takeover = "none" } = {}) {
   if (!rootStats?.isDirectory() || rootStats.isSymbolicLink()) {
     throw new GuidanceError(`Project root must be a real directory: ${projectRoot}`);
   }
-  const targets = renderCanonicalTargets(projectRoot);
-  const expectedPaths = new Set(targets.map(({ relativePath }) => relativePath));
-  return [
-    ...targets.map((target) => classifyTarget(projectRoot, target, takeover)),
-    ...classifyDisabledOwnedTargets(projectRoot, expectedPaths),
-    ...classifyManagedRuleNamespaces(projectRoot, expectedPaths),
-  ];
+  return planProjectWithRootIdentity(projectRoot, rootStats, takeover);
 }
 
 function assertTargetAtPathUnchanged(path, item) {
@@ -1486,18 +1505,21 @@ function removeStagedTemporaryOrThrow(staged) {
   }
 }
 
-function stageAtomicWrite(root, item) {
+function stageAtomicWrite(root, item, rootIdentity) {
+  assertProjectRootUnchanged(root, rootIdentity, "before guidance was staged");
   assertTargetUnchanged(root, item);
+  assertProjectRootUnchanged(root, rootIdentity, "before guidance was staged");
   const path = absoluteTargetPath(root, item.relativePath);
   const parent = dirname(path);
-  const createdDirectories = ensureTargetParentDirectories(root, item.relativePath);
+  const createdDirectories = ensureTargetParentDirectories(root, item.relativePath, rootIdentity);
+  assertProjectRootUnchanged(root, rootIdentity, "while guidance was being staged");
   const issue = parentPathIssue(root, item.relativePath);
   if (issue) {
     removeCreatedDirectories(createdDirectories);
     throw new GuidanceError(`${item.relativePath}: ${issue}`);
   }
 
-  const parentStats = lstatIfExists(parent);
+  const parentStats = parent === root ? rootIdentity : lstatIfExists(parent);
   if (!parentStats?.isDirectory() || parentStats.isSymbolicLink()) {
     removeCreatedDirectories(createdDirectories);
     throw new GuidanceError(`${item.relativePath}: generated parent is not a real directory`);
@@ -1511,6 +1533,7 @@ function stageAtomicWrite(root, item) {
       parentStats,
       `${item.relativePath} parent directory changed while staging.`,
       () => {
+        assertProjectRootUnchanged(root, rootIdentity, "while guidance was being staged");
         assertTargetAtPathUnchanged(targetName, item);
         const currentStats = lstatIfExists(targetName);
         const preservedMode = currentStats?.isFile() && !currentStats.isSymbolicLink()
@@ -1547,6 +1570,7 @@ function stageAtomicWrite(root, item) {
             temporaryName,
             `${item.relativePath} temporary file changed while being staged.`,
           );
+          assertProjectRootUnchanged(root, rootIdentity, "while guidance was being staged");
           const currentParent = lstatIfExists(parent);
           if (
             !currentParent?.isDirectory() ||
@@ -1596,14 +1620,16 @@ function stageAtomicWrite(root, item) {
   }
 }
 
-function commitStagedWrite(root, staged) {
+function commitStagedWrite(root, staged, rootIdentity) {
   const { item, parent, parentIdentity, targetName, temporaryName } = staged;
+  assertProjectRootUnchanged(root, rootIdentity, "before guidance was published");
   try {
     withStableDirectory(
       parent,
       parentIdentity,
       `${item.relativePath} parent directory changed before publication.`,
       () => {
+        assertProjectRootUnchanged(root, rootIdentity, "before guidance was published");
         assertTargetAtPathUnchanged(targetName, item);
         assertStagedFileUnchanged(
           staged,
@@ -1628,6 +1654,7 @@ function commitStagedWrite(root, staged) {
               targetName,
               `${item.relativePath} contents changed during publication.`,
             );
+            assertProjectRootUnchanged(root, rootIdentity, "while guidance was being published");
             const currentParent = lstatIfExists(parent);
             if (
               !currentParent?.isDirectory() ||
@@ -1673,6 +1700,7 @@ function commitStagedWrite(root, staged) {
           targetName,
           `${item.relativePath} contents changed during publication.`,
         );
+        assertProjectRootUnchanged(root, rootIdentity, "while guidance was being published");
         const currentParent = lstatIfExists(parent);
         if (
           !currentParent?.isDirectory() ||
@@ -1690,11 +1718,12 @@ function commitStagedWrite(root, staged) {
   }
 }
 
-function commitDeletion(root, item) {
+function commitDeletion(root, item, rootIdentity) {
+  assertProjectRootUnchanged(root, rootIdentity, "before obsolete guidance was deleted");
   const path = absoluteTargetPath(root, item.relativePath);
   const targetName = basename(path);
   const targetParent = dirname(path);
-  const targetParentStats = lstatIfExists(targetParent);
+  const targetParentStats = targetParent === root ? rootIdentity : lstatIfExists(targetParent);
   if (!targetParentStats?.isDirectory() || targetParentStats.isSymbolicLink()) {
     throw new GuidanceError(`Could not remove obsolete ${item.relativePath}: parent changed.`);
   }
@@ -1704,11 +1733,13 @@ function commitDeletion(root, item) {
       targetParentStats,
       `${item.relativePath} parent directory changed before deletion.`,
       () => {
+        assertProjectRootUnchanged(root, rootIdentity, "before obsolete guidance was deleted");
         assertTargetAtPathUnchanged(targetName, item);
         rmSync(targetName);
       },
     );
     item.committed = true;
+    assertProjectRootUnchanged(root, rootIdentity, "while obsolete guidance was being deleted");
     const managedNamespace = Object.values(SCOPED_ADAPTERS)
       .map(({ namespace }) => namespace)
       .find((namespace) => item.relativePath.startsWith(`${namespace}/`));
@@ -1726,8 +1757,10 @@ function commitDeletion(root, item) {
   }
 }
 
-function assertCanonicalSourceMatchesPlan(root, plan) {
+function assertCanonicalSourceMatchesPlan(root, rootIdentity, plan) {
+  assertProjectRootUnchanged(root, rootIdentity, "while canonical guidance was being verified");
   const currentTargets = renderCanonicalTargets(root);
+  assertProjectRootUnchanged(root, rootIdentity, "while canonical guidance was being verified");
   const plannedContents = new Map(
     plan
       .filter((item) => typeof item.contents === "string")
@@ -1754,23 +1787,35 @@ export function checkProject(root) {
 }
 
 export function syncProject(root, { takeover = "none" } = {}) {
+  if (!["none", "adopt", "force"].includes(takeover)) {
+    throw new GuidanceError(`Unsupported takeover mode: ${takeover}`);
+  }
   const projectRoot = resolve(root);
-  const plan = planProject(projectRoot, { takeover });
+  const rootStats = lstatIfExists(projectRoot);
+  if (!rootStats?.isDirectory() || rootStats.isSymbolicLink()) {
+    throw new GuidanceError(`Project root must be a real directory: ${projectRoot}`);
+  }
+  const plan = planProjectWithRootIdentity(projectRoot, rootStats, takeover);
   const blocked = plan.filter((item) => ["conflict", "unsafe"].includes(item.action));
   if (blocked.length > 0) {
     return { changed: [], ok: false, plan, root: projectRoot };
   }
 
   const changed = plan.filter((item) => item.action !== "unchanged");
-  for (const item of changed) assertTargetUnchanged(projectRoot, item);
-  assertCanonicalSourceMatchesPlan(projectRoot, plan);
+  for (const item of changed) {
+    assertProjectRootUnchanged(projectRoot, rootStats, "before guidance was synchronized");
+    assertTargetUnchanged(projectRoot, item);
+  }
+  assertCanonicalSourceMatchesPlan(projectRoot, rootStats, plan);
 
   const staged = [];
   const deletions = changed.filter((item) => item.action === "delete");
   const writes = changed.filter((item) => item.action !== "delete");
   try {
-    for (const item of writes) staged.push(stageAtomicWrite(projectRoot, item));
-    assertCanonicalSourceMatchesPlan(projectRoot, plan);
+    for (const item of writes) {
+      staged.push(stageAtomicWrite(projectRoot, item, rootStats));
+    }
+    assertCanonicalSourceMatchesPlan(projectRoot, rootStats, plan);
   } catch (error) {
     for (const stagedWrite of staged) removeStagedTemporary(stagedWrite);
     for (const stagedWrite of [...staged].reverse()) {
@@ -1780,8 +1825,10 @@ export function syncProject(root, { takeover = "none" } = {}) {
   }
 
   try {
-    for (const stagedWrite of staged) commitStagedWrite(projectRoot, stagedWrite);
-    for (const item of deletions) commitDeletion(projectRoot, item);
+    for (const stagedWrite of staged) {
+      commitStagedWrite(projectRoot, stagedWrite, rootStats);
+    }
+    for (const item of deletions) commitDeletion(projectRoot, item, rootStats);
   } catch (error) {
     for (const stagedWrite of staged) removeStagedTemporary(stagedWrite);
     for (const stagedWrite of [...staged].reverse()) {
