@@ -93,6 +93,25 @@ function hasSameFileIdentity(left, right) {
   return Boolean(left && right && left.dev === right.dev && left.ino === right.ino);
 }
 
+function withStableDirectory(path, expectedStats, changedMessage, operation) {
+  const previousDirectory = process.cwd();
+  try {
+    let current;
+    try {
+      process.chdir(path);
+      current = lstatSync(".");
+    } catch (error) {
+      throw new GuidanceError(changedMessage, { cause: error });
+    }
+    if (!current.isDirectory() || !hasSameFileIdentity(current, expectedStats)) {
+      throw new GuidanceError(changedMessage);
+    }
+    return operation();
+  } finally {
+    process.chdir(previousDirectory);
+  }
+}
+
 function readStableRegularFile(path, expectedStats, label) {
   let descriptor = null;
   try {
@@ -579,37 +598,48 @@ export function initProject(root) {
     { contents: INITIAL_GUIDE, relativePath: SOURCE_PATH },
     { contents: INITIAL_CONFIG, relativePath: CONFIG_PATH },
   ];
-  const inspectSource = (source) => {
-    const path = absoluteTargetPath(projectRoot, source.relativePath);
+  const inspectSourceAtPath = (path, displayPath = path) => {
     const stats = lstatIfExists(path);
     if (!stats) return null;
     if (stats.isSymbolicLink()) {
-      throw new GuidanceError(`Canonical source must not be a symlink: ${path}`);
+      throw new GuidanceError(`Canonical source must not be a symlink: ${displayPath}`);
     }
     if (!stats.isFile()) {
-      throw new GuidanceError(`Canonical source is not a regular file: ${path}`);
+      throw new GuidanceError(`Canonical source is not a regular file: ${displayPath}`);
     }
     return stats;
+  };
+  const inspectSource = (source) => {
+    const path = absoluteTargetPath(projectRoot, source.relativePath);
+    return inspectSourceAtPath(path);
   };
 
   for (const source of sources) inspectSource(source);
   if (!agentsStats) {
-    try {
-      mkdirSync(agentsPath, { mode: 0o755 });
-    } catch (error) {
-      if (!error || typeof error !== "object" || error.code !== "EEXIST") {
-        throw new GuidanceError(`Could not create canonical source directory: ${agentsPath}`, {
-          cause: error,
-        });
-      }
-    }
-    agentsStats = lstatIfExists(agentsPath);
-    if (agentsStats?.isSymbolicLink()) {
-      throw new GuidanceError(`Canonical source directory must not be a symlink: ${agentsPath}`);
-    }
-    if (!agentsStats?.isDirectory()) {
-      throw new GuidanceError(`Canonical source path is not a directory: ${agentsPath}`);
-    }
+    agentsStats = withStableDirectory(
+      projectRoot,
+      rootStats,
+      `Project root changed during initialization: ${projectRoot}`,
+      () => {
+        try {
+          mkdirSync(".agents", { mode: 0o755 });
+        } catch (error) {
+          if (!error || typeof error !== "object" || error.code !== "EEXIST") {
+            throw new GuidanceError(`Could not create canonical source directory: ${agentsPath}`, {
+              cause: error,
+            });
+          }
+        }
+        const createdStats = lstatIfExists(".agents");
+        if (createdStats?.isSymbolicLink()) {
+          throw new GuidanceError(`Canonical source directory must not be a symlink: ${agentsPath}`);
+        }
+        if (!createdStats?.isDirectory()) {
+          throw new GuidanceError(`Canonical source path is not a directory: ${agentsPath}`);
+        }
+        return createdStats;
+      },
+    );
   }
 
   const assertAgentsDirectoryUnchanged = () => {
@@ -692,7 +722,16 @@ export function initProject(root) {
   try {
     for (const stagedWrite of staged) {
       assertAgentsDirectoryUnchanged();
-      if (inspectSource(stagedWrite.item)) {
+      const targetName = basename(stagedWrite.path);
+      const changedMessage =
+        `Canonical source directory changed during initialization: ${agentsPath}`;
+      const existingBeforePublication = withStableDirectory(
+        agentsPath,
+        agentsStats,
+        changedMessage,
+        () => inspectSourceAtPath(targetName, stagedWrite.path),
+      );
+      if (existingBeforePublication) {
         existingPaths.add(stagedWrite.item.relativePath);
         removeStagedTemporaryOrThrow(stagedWrite);
         continue;
@@ -703,18 +742,55 @@ export function initProject(root) {
         );
       }
       try {
-        linkSync(stagedWrite.temporaryPath, stagedWrite.path);
+        const publication = withStableDirectory(
+          agentsPath,
+          agentsStats,
+          changedMessage,
+          () => {
+            if (inspectSourceAtPath(targetName, stagedWrite.path)) return "existing";
+            try {
+              linkSync(stagedWrite.temporaryPath, targetName);
+            } catch (error) {
+              if (
+                error &&
+                typeof error === "object" &&
+                error.code === "EEXIST" &&
+                inspectSourceAtPath(targetName, stagedWrite.path)
+              ) {
+                return "existing";
+              }
+              throw error;
+            }
+            const published = lstatIfExists(targetName);
+            if (
+              !published?.isFile() ||
+              published.isSymbolicLink() ||
+              !hasSameFileIdentity(published, stagedWrite.temporaryIdentity)
+            ) {
+              throw new GuidanceError(
+                `${stagedWrite.item.relativePath} changed during initialization.`,
+              );
+            }
+            try {
+              assertAgentsDirectoryUnchanged();
+            } catch (error) {
+              if (hasSameFileIdentity(lstatIfExists(targetName), stagedWrite.temporaryIdentity)) {
+                rmSync(targetName);
+              }
+              throw error;
+            }
+            return "created";
+          },
+        );
+        if (publication === "existing") {
+          existingPaths.add(stagedWrite.item.relativePath);
+          removeStagedTemporaryOrThrow(stagedWrite);
+          continue;
+        }
         stagedWrite.committed = true;
         createdPaths.push(stagedWrite.item.relativePath);
         removeStagedTemporaryOrThrow(stagedWrite);
       } catch (error) {
-        if (error && typeof error === "object" && error.code === "EEXIST") {
-          if (inspectSource(stagedWrite.item)) {
-            existingPaths.add(stagedWrite.item.relativePath);
-            removeStagedTemporaryOrThrow(stagedWrite);
-            continue;
-          }
-        }
         throw new GuidanceError(
           `Could not atomically create ${stagedWrite.item.relativePath}.`,
           { cause: error },
@@ -792,54 +868,59 @@ function ensureTargetParentDirectories(root, targetPath) {
 
   try {
     for (const segment of segments) {
-      const stableCurrent = lstatIfExists(current);
-      if (
-        !stableCurrent?.isDirectory() ||
-        stableCurrent.isSymbolicLink() ||
-        !hasSameFileIdentity(stableCurrent, currentStats)
-      ) {
-        throw new GuidanceError(
-          `Generated directory changed while parents were being created: ${relative(root, current).split(sep).join("/") || "."}`,
-        );
-      }
-
       const next = join(current, segment);
-      let nextStats = lstatIfExists(next);
-      let created = false;
-      if (!nextStats) {
-        try {
-          mkdirSync(next);
-          created = true;
-        } catch (error) {
-          if (!error || typeof error !== "object" || error.code !== "EEXIST") {
+      const currentDisplay = relative(root, current).split(sep).join("/") || ".";
+      const { created, nextStats } = withStableDirectory(
+        current,
+        currentStats,
+        `Generated directory changed while parents were being created: ${currentDisplay}`,
+        () => {
+          let childStats = lstatIfExists(segment);
+          let childCreated = false;
+          if (!childStats) {
+            try {
+              mkdirSync(segment);
+              childCreated = true;
+            } catch (error) {
+              if (!error || typeof error !== "object" || error.code !== "EEXIST") {
+                throw new GuidanceError(
+                  `Could not create generated directory: ${relative(root, next).split(sep).join("/")}`,
+                  { cause: error },
+                );
+              }
+            }
+            childStats = lstatIfExists(segment);
+          }
+          if (childStats?.isSymbolicLink()) {
             throw new GuidanceError(
-              `Could not create generated directory: ${relative(root, next).split(sep).join("/")}`,
-              { cause: error },
+              `generated path traverses a symlink: ${relative(root, next).split(sep).join("/")}`,
             );
           }
-        }
-        const currentAfterCreate = lstatIfExists(current);
-        if (
-          !currentAfterCreate?.isDirectory() ||
-          currentAfterCreate.isSymbolicLink() ||
-          !hasSameFileIdentity(currentAfterCreate, currentStats)
-        ) {
-          throw new GuidanceError(
-            `Generated directory changed while parents were being created: ${relative(root, current).split(sep).join("/") || "."}`,
-          );
-        }
-        nextStats = lstatIfExists(next);
-      }
-      if (nextStats?.isSymbolicLink()) {
-        throw new GuidanceError(
-          `generated path traverses a symlink: ${relative(root, next).split(sep).join("/")}`,
-        );
-      }
-      if (!nextStats?.isDirectory()) {
-        throw new GuidanceError(
-          `generated path traverses a non-directory: ${relative(root, next).split(sep).join("/")}`,
-        );
-      }
+          if (!childStats?.isDirectory()) {
+            throw new GuidanceError(
+              `generated path traverses a non-directory: ${relative(root, next).split(sep).join("/")}`,
+            );
+          }
+          const currentParent = lstatIfExists(current);
+          if (
+            !currentParent?.isDirectory() ||
+            currentParent.isSymbolicLink() ||
+            !hasSameFileIdentity(currentParent, currentStats)
+          ) {
+            if (
+              childCreated &&
+              hasSameFileIdentity(lstatIfExists(segment), childStats) &&
+              readdirSync(segment).length === 0
+            ) {
+              rmdirSync(segment);
+            }
+            throw new GuidanceError(
+              `Generated directory changed while parents were being created: ${currentDisplay}`,
+            );
+          }
+          return { created: childCreated, nextStats: childStats };
+        },
+      );
       if (created) {
         createdDirectories.push({
           identity: { dev: nextStats.dev, ino: nextStats.ino },
@@ -1271,11 +1352,7 @@ export function planProject(root, { takeover = "none" } = {}) {
   ];
 }
 
-function assertTargetUnchanged(root, item) {
-  const issue = parentPathIssue(root, item.relativePath);
-  if (issue) throw new GuidanceError(`${item.relativePath}: ${issue}`);
-
-  const path = absoluteTargetPath(root, item.relativePath);
+function assertTargetAtPathUnchanged(path, item) {
   const stats = lstatIfExists(path);
   if (item.originalContents === null) {
     if (stats) {
@@ -1294,8 +1371,14 @@ function assertTargetUnchanged(root, item) {
   }
 }
 
-function temporaryFileIsOriginal(staged) {
-  const stats = lstatIfExists(staged.temporaryPath);
+function assertTargetUnchanged(root, item) {
+  const issue = parentPathIssue(root, item.relativePath);
+  if (issue) throw new GuidanceError(`${item.relativePath}: ${issue}`);
+  assertTargetAtPathUnchanged(absoluteTargetPath(root, item.relativePath), item);
+}
+
+function temporaryFileIsOriginal(staged, path = staged.temporaryPath) {
+  const stats = lstatIfExists(path);
   return Boolean(
     stats?.isFile() &&
       !stats.isSymbolicLink() &&
@@ -1334,61 +1417,98 @@ function stageAtomicWrite(root, item) {
     throw new GuidanceError(`${item.relativePath}: ${issue}`);
   }
 
-  const currentStats = lstatIfExists(path);
-  const preservedMode = currentStats?.isFile() && !currentStats.isSymbolicLink()
-    ? currentStats.mode & 0o777
-    : null;
-  const temporaryPath = join(parent, `.${basename(path)}.${process.pid}.${randomUUID()}.tmp`);
-  let temporaryCreated = false;
-  let temporaryDescriptor = null;
-  let temporaryIdentity = null;
-
+  const parentStats = lstatIfExists(parent);
+  if (!parentStats?.isDirectory() || parentStats.isSymbolicLink()) {
+    removeCreatedDirectories(createdDirectories);
+    throw new GuidanceError(`${item.relativePath}: generated parent is not a real directory`);
+  }
+  const targetName = basename(path);
+  const temporaryName = `.${targetName}.${process.pid}.${randomUUID()}.tmp`;
+  const temporaryPath = join(parent, temporaryName);
   try {
-    temporaryDescriptor = openSync(temporaryPath, "wx", preservedMode ?? 0o666);
-    temporaryCreated = true;
-    temporaryIdentity = fstatSync(temporaryDescriptor);
-    writeFileSync(temporaryDescriptor, item.contents, "utf8");
-    if (preservedMode !== null) fchmodSync(temporaryDescriptor, preservedMode);
-    fsyncSync(temporaryDescriptor);
-    closeSync(temporaryDescriptor);
-    temporaryDescriptor = null;
+    return withStableDirectory(
+      parent,
+      parentStats,
+      `${item.relativePath} parent directory changed while staging.`,
+      () => {
+        assertTargetAtPathUnchanged(targetName, item);
+        const currentStats = lstatIfExists(targetName);
+        const preservedMode = currentStats?.isFile() && !currentStats.isSymbolicLink()
+          ? currentStats.mode & 0o777
+          : null;
+        let temporaryCreated = false;
+        let temporaryDescriptor = null;
+        let temporaryIdentity = null;
+        try {
+          temporaryDescriptor = openSync(temporaryName, "wx", preservedMode ?? 0o666);
+          temporaryCreated = true;
+          temporaryIdentity = fstatSync(temporaryDescriptor);
+          writeFileSync(temporaryDescriptor, item.contents, "utf8");
+          if (preservedMode !== null) fchmodSync(temporaryDescriptor, preservedMode);
+          fsyncSync(temporaryDescriptor);
+          closeSync(temporaryDescriptor);
+          temporaryDescriptor = null;
 
-    assertTargetUnchanged(root, item);
-    const staged = {
-      committed: false,
-      createdDirectories,
-      item,
-      path,
-      temporaryIdentity,
-      temporaryPath,
-    };
-    if (!temporaryFileIsOriginal(staged)) {
-      throw new GuidanceError(`${item.relativePath} temporary file changed while being staged.`);
-    }
-    return staged;
-  } catch (error) {
-    if (temporaryDescriptor !== null) {
-      try {
-        closeSync(temporaryDescriptor);
-      } catch {
-        // Preserve the original failure; cleanup remains best-effort.
-      }
-    }
-    if (temporaryCreated && temporaryIdentity) {
-      try {
-        const currentTemporary = lstatIfExists(temporaryPath);
-        if (
-          currentTemporary?.isFile() &&
-          !currentTemporary.isSymbolicLink() &&
-          currentTemporary.dev === temporaryIdentity.dev &&
-          currentTemporary.ino === temporaryIdentity.ino
-        ) {
-          rmSync(temporaryPath, { force: true });
+          assertTargetAtPathUnchanged(targetName, item);
+          const staged = {
+            committed: false,
+            createdDirectories,
+            item,
+            parent,
+            parentIdentity: parentStats,
+            path,
+            targetName,
+            temporaryIdentity,
+            temporaryName,
+            temporaryPath,
+          };
+          if (!temporaryFileIsOriginal(staged, temporaryName)) {
+            throw new GuidanceError(
+              `${item.relativePath} temporary file changed while being staged.`,
+            );
+          }
+          const currentParent = lstatIfExists(parent);
+          if (
+            !currentParent?.isDirectory() ||
+            currentParent.isSymbolicLink() ||
+            !hasSameFileIdentity(currentParent, parentStats)
+          ) {
+            if (temporaryFileIsOriginal(staged, temporaryName)) {
+              rmSync(temporaryName, { force: true });
+            }
+            throw new GuidanceError(
+              `${item.relativePath} parent directory changed while staging.`,
+            );
+          }
+          return staged;
+        } catch (error) {
+          if (temporaryDescriptor !== null) {
+            try {
+              closeSync(temporaryDescriptor);
+            } catch {
+              // Preserve the original failure; cleanup remains best-effort.
+            }
+          }
+          if (temporaryCreated && temporaryIdentity) {
+            try {
+              const currentTemporary = lstatIfExists(temporaryName);
+              if (
+                currentTemporary?.isFile() &&
+                !currentTemporary.isSymbolicLink() &&
+                currentTemporary.dev === temporaryIdentity.dev &&
+                currentTemporary.ino === temporaryIdentity.ino
+              ) {
+                rmSync(temporaryName, { force: true });
+              }
+            } catch {
+              // Preserve the original failure; cleanup remains best-effort.
+            }
+          }
+          throw error;
         }
-      } catch {
-        // Preserve the original failure; cleanup remains best-effort.
-      }
-    }
+      },
+    );
+  } catch (error) {
     removeCreatedDirectories(createdDirectories);
     throw new GuidanceError(`Could not stage atomic write for ${item.relativePath}.`, {
       cause: error,
@@ -1397,31 +1517,103 @@ function stageAtomicWrite(root, item) {
 }
 
 function commitStagedWrite(root, staged) {
-  const { item, path, temporaryPath } = staged;
-  assertTargetUnchanged(root, item);
-  if (!temporaryFileIsOriginal(staged)) {
-    throw new GuidanceError(`${item.relativePath} temporary file changed before publication.`);
-  }
-
+  const { item, parent, parentIdentity, targetName, temporaryName } = staged;
   try {
-    if (item.originalContents === null) {
-      linkSync(temporaryPath, path);
-      staged.committed = true;
-      removeStagedTemporaryOrThrow(staged);
-      return;
-    }
-    renameSync(temporaryPath, path);
-    staged.committed = true;
+    withStableDirectory(
+      parent,
+      parentIdentity,
+      `${item.relativePath} parent directory changed before publication.`,
+      () => {
+        assertTargetAtPathUnchanged(targetName, item);
+        if (!temporaryFileIsOriginal(staged, temporaryName)) {
+          throw new GuidanceError(
+            `${item.relativePath} temporary file changed before publication.`,
+          );
+        }
+
+        if (item.originalContents === null) {
+          linkSync(temporaryName, targetName);
+          staged.committed = true;
+          const published = lstatIfExists(targetName);
+          if (
+            !published?.isFile() ||
+            published.isSymbolicLink() ||
+            !hasSameFileIdentity(published, staged.temporaryIdentity)
+          ) {
+            throw new GuidanceError(`${item.relativePath} changed during publication.`);
+          }
+          const currentParent = lstatIfExists(parent);
+          if (
+            !currentParent?.isDirectory() ||
+            currentParent.isSymbolicLink() ||
+            !hasSameFileIdentity(currentParent, parentIdentity)
+          ) {
+            if (hasSameFileIdentity(lstatIfExists(targetName), staged.temporaryIdentity)) {
+              rmSync(targetName);
+            }
+            if (temporaryFileIsOriginal(staged, temporaryName)) {
+              rmSync(temporaryName, { force: true });
+            }
+            staged.committed = false;
+            throw new GuidanceError(
+              `${item.relativePath} parent directory changed during publication.`,
+            );
+          }
+          if (temporaryFileIsOriginal(staged, temporaryName)) {
+            rmSync(temporaryName, { force: true });
+          }
+          if (temporaryFileIsOriginal(staged, temporaryName)) {
+            throw new GuidanceError(
+              `Could not remove staged temporary file for ${item.relativePath}.`,
+            );
+          }
+          return;
+        }
+        renameSync(temporaryName, targetName);
+        staged.committed = true;
+        const published = lstatIfExists(targetName);
+        if (
+          !published?.isFile() ||
+          published.isSymbolicLink() ||
+          !hasSameFileIdentity(published, staged.temporaryIdentity)
+        ) {
+          throw new GuidanceError(`${item.relativePath} changed during publication.`);
+        }
+        const currentParent = lstatIfExists(parent);
+        if (
+          !currentParent?.isDirectory() ||
+          currentParent.isSymbolicLink() ||
+          !hasSameFileIdentity(currentParent, parentIdentity)
+        ) {
+          throw new GuidanceError(
+            `${item.relativePath} parent directory changed during publication.`,
+          );
+        }
+      },
+    );
   } catch (error) {
     throw new GuidanceError(`Could not atomically publish ${item.relativePath}.`, { cause: error });
   }
 }
 
 function commitDeletion(root, item) {
-  assertTargetUnchanged(root, item);
   const path = absoluteTargetPath(root, item.relativePath);
+  const targetName = basename(path);
+  const targetParent = dirname(path);
+  const targetParentStats = lstatIfExists(targetParent);
+  if (!targetParentStats?.isDirectory() || targetParentStats.isSymbolicLink()) {
+    throw new GuidanceError(`Could not remove obsolete ${item.relativePath}: parent changed.`);
+  }
   try {
-    rmSync(path);
+    withStableDirectory(
+      targetParent,
+      targetParentStats,
+      `${item.relativePath} parent directory changed before deletion.`,
+      () => {
+        assertTargetAtPathUnchanged(targetName, item);
+        rmSync(targetName);
+      },
+    );
     item.committed = true;
     const managedNamespace = Object.values(SCOPED_ADAPTERS)
       .map(({ namespace }) => namespace)

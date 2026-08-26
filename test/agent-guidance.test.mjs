@@ -334,6 +334,65 @@ if (!failure || !/changed during initialization/.test(failure.message)) throw fa
   assert.ok(lstatSync(movedAgentsPath).isDirectory());
 });
 
+test(
+  "init publishes through the verified source directory after its path is replaced",
+  { skip: process.platform === "win32" },
+  (t) => {
+    const root = temporaryDirectory(t);
+    const agentsPath = join(root, ".agents");
+    const movedAgentsPath = join(root, ".agents-original");
+    const outside = temporaryDirectory(t, "agent-guidance-init-publish-outside-");
+    mkdirSync(agentsPath);
+
+    const script = `
+import fs from "node:fs";
+import { syncBuiltinESMExports } from "node:module";
+import { basename, join } from "node:path";
+
+const root = ${JSON.stringify(root)};
+const agentsPath = ${JSON.stringify(agentsPath)};
+const movedAgentsPath = ${JSON.stringify(movedAgentsPath)};
+const outside = ${JSON.stringify(outside)};
+const originalLinkSync = fs.linkSync;
+let swapped = false;
+fs.linkSync = (source, destination) => {
+  if (!swapped && typeof destination === "string" && basename(destination) === "guide.md") {
+    fs.renameSync(agentsPath, movedAgentsPath);
+    fs.symlinkSync(outside, agentsPath, "dir");
+    swapped = true;
+  }
+  const result = originalLinkSync(source, destination);
+  if (fs.existsSync(join(outside, "guide.md"))) {
+    process.stdout.write("external-guide-published\\n");
+  }
+  return result;
+};
+syncBuiltinESMExports();
+
+const { initProject } = await import(${JSON.stringify(pathToFileURL(join(packageRoot, "src", "index.mjs")).href)});
+let failure = null;
+try {
+  initProject(root);
+} catch (error) {
+  failure = error;
+}
+if (!swapped) throw new Error("The publication substitution was not injected.");
+const failureMessages = [];
+for (let current = failure; current; current = current.cause) failureMessages.push(current.message);
+if (!failureMessages.some((message) => /changed during initialization/.test(message))) throw failure;
+`;
+    const result = spawnSync(process.execPath, ["--input-type=module", "--eval", script], {
+      encoding: "utf8",
+    });
+
+    assert.equal(result.status, 0, result.stderr);
+    assert.doesNotMatch(result.stdout, /external-guide-published/);
+    assert.deepEqual(listFiles(outside), []);
+    assert.deepEqual(listFiles(movedAgentsPath), []);
+    assert.equal(listFiles(root).some((path) => path.endsWith(".tmp")), false);
+  },
+);
+
 test("init rejects non-directory and non-regular canonical source paths", (t) => {
   const directoryRoot = temporaryDirectory(t);
   writeFileSync(join(directoryRoot, ".agents"), "not a directory\n");
@@ -1440,6 +1499,257 @@ test(
     assert.equal(lstatSync(join(root, ".cursor")).isSymbolicLink(), true);
     assert.equal(lstatIfExists(join(root, "AGENTS.md")), null);
     assert.equal(lstatIfExists(join(root, "CLAUDE.md")), null);
+    assert.equal(listFiles(root).some((path) => path.endsWith(".tmp")), false);
+  },
+);
+
+test(
+  "creates each generated parent through its verified ancestor directory",
+  { skip: process.platform === "win32" },
+  (t) => {
+    const root = temporaryRepo(t);
+    const cursorPath = join(root, ".cursor");
+    const movedCursorPath = join(root, ".cursor-original");
+    const outside = temporaryDirectory(t, "agent-guidance-parent-create-outside-");
+    mkdirSync(cursorPath);
+
+    const script = `
+import fs from "node:fs";
+import { syncBuiltinESMExports } from "node:module";
+import { basename, join } from "node:path";
+
+const root = ${JSON.stringify(root)};
+const cursorPath = ${JSON.stringify(cursorPath)};
+const movedCursorPath = ${JSON.stringify(movedCursorPath)};
+const outside = ${JSON.stringify(outside)};
+const originalMkdirSync = fs.mkdirSync;
+let swapped = false;
+fs.mkdirSync = (path, options) => {
+  if (!swapped && typeof path === "string" && basename(path) === "rules") {
+    fs.renameSync(cursorPath, movedCursorPath);
+    fs.symlinkSync(outside, cursorPath, "dir");
+    swapped = true;
+  }
+  const result = originalMkdirSync(path, options);
+  if (fs.existsSync(join(outside, "rules"))) {
+    process.stdout.write("external-rules-created\\n");
+  }
+  return result;
+};
+syncBuiltinESMExports();
+
+const { syncProject } = await import(${JSON.stringify(pathToFileURL(join(packageRoot, "src", "index.mjs")).href)});
+let failure = null;
+try {
+  syncProject(root);
+} catch (error) {
+  failure = error;
+}
+if (!swapped) throw new Error("The parent-directory substitution was not injected.");
+if (!failure || !/generated path traverses a symlink|changed while parents were being created/.test(failure.message)) {
+  throw failure;
+}
+`;
+    const result = spawnSync(process.execPath, ["--input-type=module", "--eval", script], {
+      encoding: "utf8",
+    });
+
+    assert.equal(result.status, 0, result.stderr);
+    assert.doesNotMatch(result.stdout, /external-rules-created/);
+    assert.deepEqual(listFiles(outside), []);
+    assert.deepEqual(listFiles(movedCursorPath), []);
+    assert.equal(listFiles(root).some((path) => path.endsWith(".tmp")), false);
+  },
+);
+
+test(
+  "stages generated temporary files through their verified parent directory",
+  { skip: process.platform === "win32" },
+  (t) => {
+    const root = temporaryRepo(t);
+    const rulesPath = join(root, ".cursor", "rules");
+    const movedRulesPath = join(root, ".cursor-rules-original");
+    const outside = temporaryDirectory(t, "agent-guidance-stage-parent-outside-");
+    mkdirSync(rulesPath, { recursive: true });
+
+    const script = `
+import fs from "node:fs";
+import { syncBuiltinESMExports } from "node:module";
+import { basename } from "node:path";
+
+const root = ${JSON.stringify(root)};
+const rulesPath = ${JSON.stringify(rulesPath)};
+const movedRulesPath = ${JSON.stringify(movedRulesPath)};
+const outside = ${JSON.stringify(outside)};
+const originalOpenSync = fs.openSync;
+let swapped = false;
+fs.openSync = (path, flags, mode) => {
+  if (
+    !swapped &&
+    typeof path === "string" &&
+    basename(path).startsWith(".agent-guidance.mdc.") &&
+    path.endsWith(".tmp")
+  ) {
+    fs.renameSync(rulesPath, movedRulesPath);
+    fs.symlinkSync(outside, rulesPath, "dir");
+    swapped = true;
+  }
+  const descriptor = originalOpenSync(path, flags, mode);
+  if (fs.readdirSync(outside).some((entry) => entry.endsWith(".tmp"))) {
+    process.stdout.write("external-temp-opened\\n");
+  }
+  return descriptor;
+};
+syncBuiltinESMExports();
+
+const { syncProject } = await import(${JSON.stringify(pathToFileURL(join(packageRoot, "src", "index.mjs")).href)});
+let failure = null;
+try {
+  syncProject(root);
+} catch (error) {
+  failure = error;
+}
+if (!swapped) throw new Error("The staging substitution was not injected.");
+const failureMessages = [];
+for (let current = failure; current; current = current.cause) failureMessages.push(current.message);
+if (!failureMessages.some((message) => /parent directory changed while staging/.test(message))) {
+  throw failure;
+}
+`;
+    const result = spawnSync(process.execPath, ["--input-type=module", "--eval", script], {
+      encoding: "utf8",
+    });
+
+    assert.equal(result.status, 0, result.stderr);
+    assert.doesNotMatch(result.stdout, /external-temp-opened/);
+    assert.deepEqual(listFiles(outside), []);
+    assert.deepEqual(listFiles(movedRulesPath), []);
+    assert.equal(listFiles(root).some((path) => path.endsWith(".tmp")), false);
+  },
+);
+
+test(
+  "publishes generated files through their verified parent directory",
+  { skip: process.platform === "win32" },
+  (t) => {
+    const root = temporaryRepo(t);
+    const rulesPath = join(root, ".cursor", "rules");
+    const movedRulesPath = join(root, ".cursor-rules-original");
+    const outside = temporaryDirectory(t, "agent-guidance-publish-parent-outside-");
+    mkdirSync(rulesPath, { recursive: true });
+
+    const script = `
+import fs from "node:fs";
+import { syncBuiltinESMExports } from "node:module";
+import { basename, join } from "node:path";
+
+const root = ${JSON.stringify(root)};
+const rulesPath = ${JSON.stringify(rulesPath)};
+const movedRulesPath = ${JSON.stringify(movedRulesPath)};
+const outside = ${JSON.stringify(outside)};
+const originalLinkSync = fs.linkSync;
+let swapped = false;
+fs.linkSync = (source, destination) => {
+  if (
+    !swapped &&
+    typeof destination === "string" &&
+    basename(destination) === "agent-guidance.mdc"
+  ) {
+    fs.renameSync(rulesPath, movedRulesPath);
+    fs.symlinkSync(outside, rulesPath, "dir");
+    swapped = true;
+  }
+  const result = originalLinkSync(source, destination);
+  if (fs.existsSync(join(outside, "agent-guidance.mdc"))) {
+    process.stdout.write("external-output-published\\n");
+  }
+  return result;
+};
+syncBuiltinESMExports();
+
+const { syncProject } = await import(${JSON.stringify(pathToFileURL(join(packageRoot, "src", "index.mjs")).href)});
+let failure = null;
+try {
+  syncProject(root);
+} catch (error) {
+  failure = error;
+}
+if (!swapped) throw new Error("The publication substitution was not injected.");
+const failureMessages = [];
+for (let current = failure; current; current = current.cause) failureMessages.push(current.message);
+if (!failureMessages.some((message) => /parent directory changed during publication/.test(message))) {
+  throw failure;
+}
+`;
+    const result = spawnSync(process.execPath, ["--input-type=module", "--eval", script], {
+      encoding: "utf8",
+    });
+
+    assert.equal(result.status, 0, result.stderr);
+    assert.doesNotMatch(result.stdout, /external-output-published/);
+    assert.deepEqual(listFiles(outside), []);
+    assert.deepEqual(listFiles(movedRulesPath), []);
+    assert.equal(listFiles(root).some((path) => path.endsWith(".tmp")), false);
+  },
+);
+
+test(
+  "deletes obsolete outputs through their verified parent directory",
+  { skip: process.platform === "win32" },
+  (t) => {
+    const root = temporaryDirectory(t);
+    cpSync(join(scopedFixtureRoot, ".agents"), join(root, ".agents"), { recursive: true });
+    assert.equal(runCli(root, "sync").status, 0);
+    rmSync(join(root, ".agents", "rules", "frontend", "react.md"));
+
+    const targetParent = join(root, ".cursor", "rules", "agent-guidance", "frontend");
+    const movedTargetParent = join(
+      root,
+      ".cursor",
+      "rules",
+      "agent-guidance",
+      "frontend-original",
+    );
+    const outside = temporaryDirectory(t, "agent-guidance-delete-parent-outside-");
+    writeFileSync(join(outside, "react.mdc"), "outside\n");
+
+    const script = `
+import fs from "node:fs";
+import { syncBuiltinESMExports } from "node:module";
+import { basename, join } from "node:path";
+
+const root = ${JSON.stringify(root)};
+const targetParent = ${JSON.stringify(targetParent)};
+const movedTargetParent = ${JSON.stringify(movedTargetParent)};
+const outside = ${JSON.stringify(outside)};
+const originalRmSync = fs.rmSync;
+let swapped = false;
+fs.rmSync = (path, options) => {
+  if (!swapped && typeof path === "string" && basename(path) === "react.mdc") {
+    fs.renameSync(targetParent, movedTargetParent);
+    fs.symlinkSync(outside, targetParent, "dir");
+    swapped = true;
+  }
+  const result = originalRmSync(path, options);
+  if (!fs.existsSync(join(outside, "react.mdc"))) {
+    process.stdout.write("external-output-deleted\\n");
+  }
+  return result;
+};
+syncBuiltinESMExports();
+
+const { syncProject } = await import(${JSON.stringify(pathToFileURL(join(packageRoot, "src", "index.mjs")).href)});
+syncProject(root);
+if (!swapped) throw new Error("The deletion substitution was not injected.");
+`;
+    const result = spawnSync(process.execPath, ["--input-type=module", "--eval", script], {
+      encoding: "utf8",
+    });
+
+    assert.equal(result.status, 0, result.stderr);
+    assert.doesNotMatch(result.stdout, /external-output-deleted/);
+    assert.equal(readFileSync(join(outside, "react.mdc"), "utf8"), "outside\n");
+    assert.deepEqual(listFiles(movedTargetParent), []);
     assert.equal(listFiles(root).some((path) => path.endsWith(".tmp")), false);
   },
 );
