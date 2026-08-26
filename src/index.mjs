@@ -1986,6 +1986,7 @@ export function syncProject(root, { takeover = "none" } = {}) {
       commitStagedWrite(projectRoot, stagedWrite, rootStats);
     }
     for (const item of deletions) commitDeletion(projectRoot, item, rootStats);
+    assertCanonicalSourceMatchesPlan(projectRoot, rootStats, plan);
   } catch (error) {
     for (const stagedWrite of staged) removeStagedTemporary(stagedWrite);
     for (const stagedWrite of [...staged].reverse()) {

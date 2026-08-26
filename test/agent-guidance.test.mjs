@@ -2395,6 +2395,105 @@ if (!failureMessages.some((message) => /temporary file changed before publicatio
   }
 });
 
+test("sync rejects canonical changes during create, update, and deletion commits", (t) => {
+  for (const action of ["create", "update", "delete"]) {
+    const root = temporaryRepo(t);
+    if (action === "update") {
+      assert.equal(runCli(root, "sync").status, 0);
+      writeFileSync(join(root, ".agents", "guide.md"), "# Planned guidance\n");
+    }
+    if (action === "delete") {
+      writeFileSync(
+        join(root, ".agents", "config.yaml"),
+        `version: 1
+adapters:
+  agents: false
+  claude: false
+  cursor: false
+  copilot: true
+`,
+      );
+      assert.equal(runCli(root, "sync").status, 0);
+      writeFileSync(
+        join(root, ".agents", "config.yaml"),
+        `version: 1
+adapters:
+  agents: false
+  claude: false
+  cursor: false
+  copilot: false
+`,
+      );
+    }
+
+    const script = `
+import fs from "node:fs";
+import { syncBuiltinESMExports } from "node:module";
+import { basename, join } from "node:path";
+
+const root = ${JSON.stringify(root)};
+const action = ${JSON.stringify(action)};
+const originalLinkSync = fs.linkSync;
+const originalRenameSync = fs.renameSync;
+const originalRmSync = fs.rmSync;
+let changed = false;
+const changeCanonicalSource = () => {
+  if (changed) return;
+  changed = true;
+  if (action === "delete") {
+    fs.writeFileSync(
+      join(root, ".agents", "config.yaml"),
+      "version: 1\\nadapters:\\n  agents: false\\n  claude: false\\n  cursor: false\\n  copilot: true\\n",
+    );
+  } else {
+    fs.writeFileSync(join(root, ".agents", "guide.md"), "# Concurrent guidance\\n");
+  }
+};
+fs.linkSync = (source, destination) => {
+  const result = originalLinkSync(source, destination);
+  if (action === "create" && basename(destination) === "AGENTS.md") changeCanonicalSource();
+  return result;
+};
+fs.renameSync = (source, destination) => {
+  const result = originalRenameSync(source, destination);
+  if (action === "update" && basename(destination) === "AGENTS.md") changeCanonicalSource();
+  return result;
+};
+fs.rmSync = (path, options) => {
+  const result = originalRmSync(path, options);
+  if (action === "delete" && basename(path) === "copilot-instructions.md") {
+    changeCanonicalSource();
+  }
+  return result;
+};
+syncBuiltinESMExports();
+
+const { syncProject } = await import(${JSON.stringify(pathToFileURL(join(packageRoot, "src", "index.mjs")).href)});
+let failure = null;
+try {
+  syncProject(root);
+} catch (error) {
+  failure = error;
+}
+if (!changed) throw new Error("The concurrent canonical change was not injected.");
+if (!failure) throw new Error("Synchronization reported success after a canonical change.");
+const failureMessages = [];
+for (let current = failure; current; current = current.cause) failureMessages.push(current.message);
+if (!failureMessages.some((message) => /Canonical source changed while guidance was being synchronized/.test(message))) {
+  throw failure;
+}
+`;
+    const result = spawnSync(process.execPath, ["--input-type=module", "--eval", script], {
+      encoding: "utf8",
+    });
+
+    assert.equal(result.status, 0, `${action}: ${result.stderr}`);
+    const check = runCli(root, "check");
+    assert.equal(check.status, 1, `${action}: ${check.stderr}`);
+    assert.equal(listFiles(root).some((path) => path.endsWith(".tmp")), false);
+  }
+});
+
 test(
   "deletes obsolete outputs through their verified parent directory",
   { skip: process.platform === "win32" },
