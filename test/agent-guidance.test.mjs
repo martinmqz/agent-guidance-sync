@@ -1207,6 +1207,158 @@ test("rejects symlinked config and rule sources without following them", (t) => 
   assert.equal(lstatIfExists(join(rulesRoot, "AGENTS.md")), null);
 });
 
+test(
+  "reads canonical children through the verified source directory",
+  { skip: process.platform === "win32" },
+  (t) => {
+    const root = temporaryDirectory(t);
+    const agentsPath = join(root, ".agents");
+    const movedAgentsPath = join(root, ".agents-original");
+    const outside = temporaryDirectory(t, "agent-guidance-canonical-parent-outside-");
+    cpSync(join(scopedFixtureRoot, ".agents"), agentsPath, { recursive: true });
+    cpSync(join(scopedFixtureRoot, ".agents"), outside, { recursive: true });
+    writeFileSync(join(outside, "guide.md"), "# Outside guidance\n");
+    writeFileSync(join(outside, "rules", "outside.md"), "# Outside rule\n");
+    const originalFiles = snapshotFiles(agentsPath);
+    const outsideFiles = snapshotFiles(outside);
+
+    const script = `
+import fs from "node:fs";
+import { syncBuiltinESMExports } from "node:module";
+
+const root = ${JSON.stringify(root)};
+const agentsPath = ${JSON.stringify(agentsPath)};
+const movedAgentsPath = ${JSON.stringify(movedAgentsPath)};
+const outside = ${JSON.stringify(outside)};
+const originalChdir = process.chdir;
+const originalOpenSync = fs.openSync;
+const originalReaddirSync = fs.readdirSync;
+let externalAccess = false;
+let swapped = false;
+process.chdir = (path) => {
+  const result = originalChdir(path);
+  if (!swapped && path === agentsPath) {
+    fs.renameSync(agentsPath, movedAgentsPath);
+    fs.symlinkSync(outside, agentsPath, "dir");
+    swapped = true;
+  }
+  return result;
+};
+fs.openSync = (path, flags, mode) => {
+  if (swapped && typeof path === "string" && path.startsWith(agentsPath + "/")) {
+    externalAccess = true;
+  }
+  return originalOpenSync(path, flags, mode);
+};
+fs.readdirSync = (path, options) => {
+  if (swapped && typeof path === "string" && path.startsWith(agentsPath + "/")) {
+    externalAccess = true;
+  }
+  return originalReaddirSync(path, options);
+};
+syncBuiltinESMExports();
+
+const { syncProject } = await import(${JSON.stringify(pathToFileURL(join(packageRoot, "src", "index.mjs")).href)});
+let failure = null;
+try {
+  syncProject(root);
+} catch (error) {
+  failure = error;
+}
+if (!swapped) throw new Error("The canonical source-directory substitution was not injected.");
+if (externalAccess) throw new Error("Synchronization accessed the replacement canonical source.");
+if (!failure) throw new Error("Synchronization accepted a replacement canonical source directory.");
+const failureMessages = [];
+for (let current = failure; current; current = current.cause) failureMessages.push(current.message);
+if (!failureMessages.some((message) => /Canonical source directory changed/.test(message))) {
+  throw failure;
+}
+`;
+    const result = spawnSync(process.execPath, ["--input-type=module", "--eval", script], {
+      encoding: "utf8",
+    });
+
+    assert.equal(result.status, 0, result.stderr);
+    assert.deepEqual(snapshotFiles(movedAgentsPath), originalFiles);
+    assert.deepEqual(snapshotFiles(outside), outsideFiles);
+    assert.equal(lstatSync(agentsPath).isSymbolicLink(), true);
+    for (const relativePath of generatedPaths) {
+      assert.equal(lstatIfExists(join(root, relativePath)), null);
+    }
+  },
+);
+
+test(
+  "traverses canonical rules through each verified directory",
+  { skip: process.platform === "win32" },
+  (t) => {
+    const root = temporaryDirectory(t);
+    cpSync(join(scopedFixtureRoot, ".agents"), join(root, ".agents"), { recursive: true });
+    const rulesPath = join(root, ".agents", "rules");
+    const movedRulesPath = join(root, ".agents", "rules-original");
+    const outside = temporaryDirectory(t, "agent-guidance-canonical-rules-outside-");
+    writeFileSync(join(outside, "outside.md"), "# Outside rule\n");
+    const originalFiles = snapshotFiles(rulesPath);
+    const outsideFiles = snapshotFiles(outside);
+
+    const script = `
+import fs from "node:fs";
+import { syncBuiltinESMExports } from "node:module";
+
+const root = ${JSON.stringify(root)};
+const rulesPath = ${JSON.stringify(rulesPath)};
+const movedRulesPath = ${JSON.stringify(movedRulesPath)};
+const outside = ${JSON.stringify(outside)};
+const originalReaddirSync = fs.readdirSync;
+let externalAccess = false;
+let swapped = false;
+fs.readdirSync = (path, options) => {
+  if (
+    !swapped &&
+    (path === rulesPath || path === ".")
+  ) {
+    fs.renameSync(rulesPath, movedRulesPath);
+    fs.symlinkSync(outside, rulesPath, "dir");
+    swapped = true;
+  }
+  const entries = originalReaddirSync(path, options);
+  if (swapped && entries.some((entry) => entry === "outside.md" || entry?.name === "outside.md")) {
+    externalAccess = true;
+  }
+  return entries;
+};
+syncBuiltinESMExports();
+
+const { syncProject } = await import(${JSON.stringify(pathToFileURL(join(packageRoot, "src", "index.mjs")).href)});
+let failure = null;
+try {
+  syncProject(root);
+} catch (error) {
+  failure = error;
+}
+if (!swapped) throw new Error("The canonical rules-directory substitution was not injected.");
+if (externalAccess) throw new Error("Synchronization traversed the replacement rules directory.");
+if (!failure) throw new Error("Synchronization accepted a replacement canonical rules directory.");
+const failureMessages = [];
+for (let current = failure; current; current = current.cause) failureMessages.push(current.message);
+if (!failureMessages.some((message) => /Canonical rules directory changed/.test(message))) {
+  throw failure;
+}
+`;
+    const result = spawnSync(process.execPath, ["--input-type=module", "--eval", script], {
+      encoding: "utf8",
+    });
+
+    assert.equal(result.status, 0, result.stderr);
+    assert.deepEqual(snapshotFiles(movedRulesPath), originalFiles);
+    assert.deepEqual(snapshotFiles(outside), outsideFiles);
+    assert.equal(lstatSync(rulesPath).isSymbolicLink(), true);
+    for (const relativePath of generatedPaths) {
+      assert.equal(lstatIfExists(join(root, relativePath)), null);
+    }
+  },
+);
+
 test("leaves unrelated files beside generated targets untouched", (t) => {
   const root = temporaryRepo(t);
   write(root, ".cursor/rules/personal.mdc", "# Personal Cursor rule\n");

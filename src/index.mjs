@@ -123,14 +123,14 @@ function withStableDirectory(path, expectedStats, changedMessage, operation) {
   }
 }
 
-function readStableRegularFile(path, expectedStats, label) {
+function readStableRegularFile(path, expectedStats, label, displayPath = path) {
   let descriptor = null;
   try {
     const noFollowFlag = process.platform === "win32" ? 0 : (fsConstants.O_NOFOLLOW ?? 0);
     descriptor = openSync(path, fsConstants.O_RDONLY | noFollowFlag);
     const openedBefore = fstatSync(descriptor);
     if (!openedBefore.isFile() || !hasSameFileIdentity(openedBefore, expectedStats)) {
-      throw new GuidanceError(`${label} changed before it could be read: ${path}`);
+      throw new GuidanceError(`${label} changed before it could be read: ${displayPath}`);
     }
 
     const contents = readFileSync(descriptor, "utf8");
@@ -146,12 +146,12 @@ function readStableRegularFile(path, expectedStats, label) {
       currentPath.isSymbolicLink() ||
       !hasSameFileIdentity(currentPath, openedBefore)
     ) {
-      throw new GuidanceError(`${label} changed while it was being read: ${path}`);
+      throw new GuidanceError(`${label} changed while it was being read: ${displayPath}`);
     }
     return contents;
   } catch (error) {
     if (error instanceof GuidanceError) throw error;
-    throw new GuidanceError(`Could not safely read ${label}: ${path}`, { cause: error });
+    throw new GuidanceError(`Could not safely read ${label}: ${displayPath}`, { cause: error });
   } finally {
     if (descriptor !== null) closeSync(descriptor);
   }
@@ -1271,7 +1271,7 @@ function classifyTarget(root, target, takeover) {
   };
 }
 
-function assertDirectoryStable(path, expectedStats, label) {
+function assertDirectoryStable(path, expectedStats, label, displayPath = path) {
   const current = lstatIfExists(path);
   if (
     !current?.isDirectory() ||
@@ -1280,13 +1280,15 @@ function assertDirectoryStable(path, expectedStats, label) {
     current.mtimeMs !== expectedStats.mtimeMs ||
     current.ctimeMs !== expectedStats.ctimeMs
   ) {
-    throw new GuidanceError(`${label} changed while canonical guidance was being read: ${path}`);
+    throw new GuidanceError(
+      `${label} changed while canonical guidance was being read: ${displayPath}`,
+    );
   }
 }
 
 function readCanonicalRules(agentsPath) {
   const rulesPath = join(agentsPath, "rules");
-  const rootStats = lstatIfExists(rulesPath);
+  const rootStats = lstatIfExists("rules");
   if (!rootStats) return [];
   if (rootStats.isSymbolicLink()) {
     throw new GuidanceError(`Canonical rules directory must not be a symlink: ${rulesPath}`);
@@ -1296,51 +1298,76 @@ function readCanonicalRules(agentsPath) {
   }
 
   const ruleFiles = [];
-  const visit = (directoryPath, relativeDirectory, expectedStats) => {
-    assertDirectoryStable(directoryPath, expectedStats, "Canonical rules directory");
-    const entries = readdirSync(directoryPath).sort();
-    for (const name of entries) {
-      const path = join(directoryPath, name);
-      const relativePath = relativeDirectory ? `${relativeDirectory}/${name}` : name;
-      const stats = lstatIfExists(path);
-      if (!stats) {
-        throw new GuidanceError(`Canonical rule changed while being discovered: ${path}`);
-      }
-      if (stats.isSymbolicLink()) {
-        throw new GuidanceError(`Canonical rules must not contain symlinks: ${path}`);
-      }
-      if (stats.isDirectory()) {
-        if (!/^[a-z0-9]+(?:-[a-z0-9]+)*$/u.test(name)) {
+  const visit = (directoryName, relativeDirectory, expectedStats) => {
+    const directoryPath = relativeDirectory ? join(rulesPath, relativeDirectory) : rulesPath;
+    withStableDirectory(
+      directoryName,
+      expectedStats,
+      `Canonical rules directory changed while canonical guidance was being read: ${directoryPath}`,
+      () => {
+        const entries = readdirSync(".").sort();
+        for (const name of entries) {
+          const relativePath = relativeDirectory ? `${relativeDirectory}/${name}` : name;
+          const path = join(rulesPath, relativePath);
+          const stats = lstatIfExists(name);
+          if (!stats) {
+            throw new GuidanceError(`Canonical rule changed while being discovered: ${path}`);
+          }
+          if (stats.isSymbolicLink()) {
+            throw new GuidanceError(`Canonical rules must not contain symlinks: ${path}`);
+          }
+          if (stats.isDirectory()) {
+            if (!/^[a-z0-9]+(?:-[a-z0-9]+)*$/u.test(name)) {
+              throw new GuidanceError(
+                `Canonical rule directories must use lowercase kebab-case: ${relativePath}`,
+              );
+            }
+            visit(name, relativePath, stats);
+            assertDirectoryStable(name, stats, "Canonical rules directory", path);
+            assertDirectoryStable(
+              ".",
+              expectedStats,
+              "Canonical rules directory",
+              directoryPath,
+            );
+            continue;
+          }
+          if (!stats.isFile()) {
+            throw new GuidanceError(`Canonical rule is not a regular file: ${path}`);
+          }
+          if (!/^[a-z0-9]+(?:-[a-z0-9]+)*\.md$/u.test(name)) continue;
+          validateRuleRelativePath(relativePath);
+          ruleFiles.push({
+            contents: readStableRegularFile(
+              name,
+              stats,
+              `canonical rule ${relativePath}`,
+              path,
+            ),
+            relativePath,
+          });
+        }
+        assertDirectoryStable(
+          ".",
+          expectedStats,
+          "Canonical rules directory",
+          directoryPath,
+        );
+        const currentEntries = readdirSync(".").sort();
+        if (
+          entries.length !== currentEntries.length ||
+          entries.some((entry, index) => entry !== currentEntries[index])
+        ) {
           throw new GuidanceError(
-            `Canonical rule directories must use lowercase kebab-case: ${relativePath}`,
+            `Canonical rules directory changed while canonical guidance was being read: ${directoryPath}`,
           );
         }
-        visit(path, relativePath, stats);
-        continue;
-      }
-      if (!stats.isFile()) {
-        throw new GuidanceError(`Canonical rule is not a regular file: ${path}`);
-      }
-      if (!/^[a-z0-9]+(?:-[a-z0-9]+)*\.md$/u.test(name)) continue;
-      validateRuleRelativePath(relativePath);
-      ruleFiles.push({
-        contents: readStableRegularFile(path, stats, `canonical rule ${relativePath}`),
-        relativePath,
-      });
-    }
-    assertDirectoryStable(directoryPath, expectedStats, "Canonical rules directory");
-    const currentEntries = readdirSync(directoryPath).sort();
-    if (
-      entries.length !== currentEntries.length ||
-      entries.some((entry, index) => entry !== currentEntries[index])
-    ) {
-      throw new GuidanceError(
-        `Canonical rules directory changed while canonical guidance was being read: ${directoryPath}`,
-      );
-    }
+      },
+    );
   };
 
-  visit(rulesPath, "", rootStats);
+  visit("rules", "", rootStats);
+  assertDirectoryStable("rules", rootStats, "Canonical rules directory", rulesPath);
   return ruleFiles;
 }
 
@@ -1364,26 +1391,46 @@ function readCanonicalProject(root) {
   };
 
   assertSourceDirectoryIdentity();
-  const guideContents = readStableRegularFile(
-    source.sourcePath,
-    source.sourceStats,
-    "canonical source",
+  const { configContents, guideContents, ruleFiles } = withStableDirectory(
+    source.agentsPath,
+    source.agentsStats,
+    `Canonical source directory changed while guidance was being read: ${source.agentsPath}`,
+    () => {
+      const guideContents = readStableRegularFile(
+        "guide.md",
+        source.sourceStats,
+        "canonical source",
+        source.sourcePath,
+      );
+      const configPath = join(root, CONFIG_PATH);
+      const configStats = lstatIfExists("config.yaml");
+      if (!configStats) {
+        throw new GuidanceError(
+          `Missing canonical config: ${configPath}. Run agent-guidance init to create it without overwriting existing canonical files.`,
+        );
+      }
+      if (configStats.isSymbolicLink()) {
+        throw new GuidanceError(`Canonical config must not be a symlink: ${configPath}`);
+      }
+      if (!configStats.isFile()) {
+        throw new GuidanceError(`Canonical config is not a regular file: ${configPath}`);
+      }
+      const configContents = readStableRegularFile(
+        "config.yaml",
+        configStats,
+        "canonical config",
+        configPath,
+      );
+      const ruleFiles = readCanonicalRules(source.agentsPath);
+      assertDirectoryStable(
+        ".",
+        source.agentsStats,
+        "Canonical source directory",
+        source.agentsPath,
+      );
+      return { configContents, guideContents, ruleFiles };
+    },
   );
-  const configPath = join(root, CONFIG_PATH);
-  const configStats = lstatIfExists(configPath);
-  if (!configStats) {
-    throw new GuidanceError(
-      `Missing canonical config: ${configPath}. Run agent-guidance init to create it without overwriting existing canonical files.`,
-    );
-  }
-  if (configStats.isSymbolicLink()) {
-    throw new GuidanceError(`Canonical config must not be a symlink: ${configPath}`);
-  }
-  if (!configStats.isFile()) {
-    throw new GuidanceError(`Canonical config is not a regular file: ${configPath}`);
-  }
-  const configContents = readStableRegularFile(configPath, configStats, "canonical config");
-  const ruleFiles = readCanonicalRules(source.agentsPath);
   assertSourceDirectoryIdentity();
   return {
     config: parseConfig(configContents),
