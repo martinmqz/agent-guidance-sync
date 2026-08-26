@@ -2494,6 +2494,110 @@ if (!failureMessages.some((message) => /Canonical source changed while guidance 
   }
 });
 
+test("sync revalidates earlier targets after create, update, and deletion commits", (t) => {
+  for (const action of ["create", "update", "delete"]) {
+    const root = temporaryRepo(t);
+    if (action === "update") {
+      assert.equal(runCli(root, "sync").status, 0);
+      writeFileSync(join(root, ".agents", "guide.md"), "# Planned guidance\n");
+    }
+    if (action === "delete") {
+      writeFileSync(
+        join(root, ".agents", "config.yaml"),
+        `version: 1
+adapters:
+  agents: true
+  claude: true
+  cursor: false
+  copilot: false
+`,
+      );
+      assert.equal(runCli(root, "sync").status, 0);
+      writeFileSync(
+        join(root, ".agents", "config.yaml"),
+        `version: 1
+adapters:
+  agents: false
+  claude: false
+  cursor: false
+  copilot: false
+`,
+      );
+    }
+
+    const script = `
+import fs from "node:fs";
+import { syncBuiltinESMExports } from "node:module";
+import { basename, join } from "node:path";
+
+const root = ${JSON.stringify(root)};
+const action = ${JSON.stringify(action)};
+const originalLinkSync = fs.linkSync;
+const originalRenameSync = fs.renameSync;
+const originalRmSync = fs.rmSync;
+const deletedTargets = [];
+let changed = false;
+const changeEarlierTarget = () => {
+  if (changed) return;
+  changed = true;
+  fs.writeFileSync(join(root, "AGENTS.md"), "concurrent generated guidance\\n");
+};
+fs.linkSync = (source, destination) => {
+  const result = originalLinkSync(source, destination);
+  if (action === "create" && basename(destination) === "CLAUDE.md") changeEarlierTarget();
+  return result;
+};
+fs.renameSync = (source, destination) => {
+  const result = originalRenameSync(source, destination);
+  if (action === "update" && basename(destination) === "agent-guidance.mdc") {
+    changeEarlierTarget();
+  }
+  return result;
+};
+fs.rmSync = (path, options) => {
+  const targetName = basename(path);
+  const targetContents =
+    action === "delete" && ["AGENTS.md", "CLAUDE.md"].includes(targetName)
+      ? fs.readFileSync(path, "utf8")
+      : null;
+  const result = originalRmSync(path, options);
+  if (targetContents !== null) {
+    deletedTargets.push({ contents: targetContents, path: join(root, targetName) });
+    if (deletedTargets.length === 2) {
+      changed = true;
+      fs.writeFileSync(deletedTargets[0].path, deletedTargets[0].contents);
+    }
+  }
+  return result;
+};
+syncBuiltinESMExports();
+
+const { syncProject } = await import(${JSON.stringify(pathToFileURL(join(packageRoot, "src", "index.mjs")).href)});
+let failure = null;
+try {
+  syncProject(root);
+} catch (error) {
+  failure = error;
+}
+if (!changed) throw new Error("The earlier generated target was not changed.");
+if (!failure) throw new Error("Synchronization reported success after an earlier target changed.");
+const failureMessages = [];
+for (let current = failure; current; current = current.cause) failureMessages.push(current.message);
+if (!failureMessages.some((message) => /AGENTS\.md changed while guidance was being synchronized/.test(message))) {
+  throw failure;
+}
+`;
+    const result = spawnSync(process.execPath, ["--input-type=module", "--eval", script], {
+      encoding: "utf8",
+    });
+
+    assert.equal(result.status, 0, `${action}: ${result.stderr}`);
+    const check = runCli(root, "check");
+    assert.equal(check.status, 1, `${action}: ${check.stderr}`);
+    assert.equal(listFiles(root).some((path) => path.endsWith(".tmp")), false);
+  }
+});
+
 test(
   "deletes obsolete outputs through their verified parent directory",
   { skip: process.platform === "win32" },

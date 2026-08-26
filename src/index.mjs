@@ -1933,6 +1933,44 @@ function assertCanonicalSourceMatchesPlan(root, rootIdentity, plan) {
   }
 }
 
+function assertCommittedTargetsMatchPlan(root, rootIdentity, staged, deletions) {
+  assertProjectRootUnchanged(root, rootIdentity, "while generated guidance was being verified");
+  for (const stagedWrite of staged) {
+    if (!stagedWrite.committed) continue;
+    const { item, parent, parentIdentity, targetName, temporaryIdentity } = stagedWrite;
+    withStableDirectory(
+      parent,
+      parentIdentity,
+      `${item.relativePath} parent directory changed after publication.`,
+      () => {
+        assertProjectRootUnchanged(root, rootIdentity, "while generated guidance was being verified");
+        const current = lstatIfExists(targetName);
+        if (
+          !current?.isFile() ||
+          current.isSymbolicLink() ||
+          !hasSameFileIdentity(current, temporaryIdentity) ||
+          readStableRegularFile(targetName, current, `generated target ${item.relativePath}`) !==
+            item.contents
+        ) {
+          throw new GuidanceError(
+            `${item.relativePath} changed while guidance was being synchronized.`,
+          );
+        }
+      },
+    );
+  }
+  for (const item of deletions) {
+    if (!item.committed) continue;
+    const issue = parentPathIssue(root, item.relativePath);
+    if (!issue && lstatIfExists(absoluteTargetPath(root, item.relativePath))) {
+      throw new GuidanceError(
+        `${item.relativePath} changed while guidance was being synchronized.`,
+      );
+    }
+  }
+  assertProjectRootUnchanged(root, rootIdentity, "while generated guidance was being verified");
+}
+
 export function checkProject(root) {
   const projectRoot = resolve(root);
   const plan = planProject(projectRoot);
@@ -1987,6 +2025,7 @@ export function syncProject(root, { takeover = "none" } = {}) {
     }
     for (const item of deletions) commitDeletion(projectRoot, item, rootStats);
     assertCanonicalSourceMatchesPlan(projectRoot, rootStats, plan);
+    assertCommittedTargetsMatchPlan(projectRoot, rootStats, staged, deletions);
   } catch (error) {
     for (const stagedWrite of staged) removeStagedTemporary(stagedWrite);
     for (const stagedWrite of [...staged].reverse()) {
