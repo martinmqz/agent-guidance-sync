@@ -95,10 +95,13 @@ an exact `agent-guidance-sync` ownership marker. The Claude adapter requires the
 AGENTS adapter because `CLAUDE.md` imports `AGENTS.md`.
 
 Cursor and Copilot also accept `rules-only`, which generates path rules but
-omits that adapter's repository-wide copy. This is useful when the client
-already reads root `AGENTS.md`. Existing owned root copies are removed; unmanaged
-root files are preserved. Keep `copilot: true` when you need the root
-`.github/copilot-instructions.md` file for GitHub.com code review. For example:
+omits that adapter's repository-wide copy. With `nested: true`, it also omits
+path-rule copies already represented by nested `AGENTS.md` files. This is useful
+when the client reads native guidance: [Cursor supports nested AGENTS.md](https://cursor.com/docs/rules),
+and [VS Code requires `chat.useAgentsMdFile` and `chat.useNestedAgentsMdFiles`](https://code.visualstudio.com/docs/agent-customization/custom-instructions#use-multiple-agentsmd-files).
+Existing owned duplicate copies are removed; unmanaged root files are preserved.
+Keep `copilot: true` when you need the root `.github/copilot-instructions.md`
+and all path instructions for GitHub.com consumers. For example:
 
 ```yaml
 version: 1
@@ -169,26 +172,40 @@ generates `<directory>/CLAUDE.md` with the same rule bodies inlined, without YAM
 frontmatter or imports. For example, `Scripts/**` and
 `MileagePosting/AlaskaAir.MileagePosting.Cores/**` each map to their own directory.
 Rules for the same directory are combined in canonical rule-path order.
+The directory must already exist, and every directory component must match its
+on-disk spelling exactly, including case and Unicode spelling. Correct the rule
+or explicitly create/rename the directory before syncing. The tool never creates
+scope directories. Existing nested filenames must likewise match `AGENTS.md` or
+`CLAUDE.md` exactly. These checks keep markers and inventory paths portable when
+the repository moves between filesystems.
 
 Patterns such as `src/**/*.ts`, wildcard directories, and rules spanning multiple
 directories retain only their Cursor/Copilot output. A shared literal prefix
 does not make a file-specific rule apply to every descendant, so the tool never
-broadens these patterns into directory instructions. Reserved `.git`, `.agents`,
-and `node_modules` directories, the two reserved `agent-guidance/` scoped-rule
-namespaces, and overlapping generated target paths are rejected.
+broadens these patterns into directory instructions. Rules for reserved `.git`,
+`.agents`, and `node_modules` directories, or either reserved `agent-guidance/`
+scoped-rule namespace, also retain only Cursor/Copilot output. Overlapping
+generated target paths are rejected.
 
 Commit the generated `.agents/nested-outputs.json` inventory alongside nested
 files. It lets `check` and `sync` find obsolete nested outputs without scanning
 the repository. Removing a rule, disabling an adapter, or removing `nested: true`
 cleans up inventory-listed files only when their exact ownership markers still
 match. Unmanaged or unsafe obsolete targets block cleanup even with `--force`.
+For an unmanaged obsolete file, restore its generated contents from version
+control, or move/remove that file explicitly before retrying. If the inventory
+is invalid, restore the inventory itself from a known-good generated copy;
+takeover flags cannot establish safe cleanup ownership. A UTF-8 BOM in the
+inventory is accepted.
 Before publishing new nested files, synchronization records both old and new
 destinations in the inventory. It removes obsolete entries only after cleanup
 succeeds, so a failed sync remains recoverable even if rules change before retry.
-Changes in scope capitalization or Unicode spelling migrate owned files when
-the filesystem treats both paths as the same directory entry.
+After an explicit directory rename, older inventory spellings can migrate owned
+files when filesystem identities prove they refer to the same directory entry.
 The tool preserves neighboring files and directories. Do not delete the inventory
 manually: without it, old nested outputs cannot be discovered for cleanup.
+No inventory is emitted when there are no nested outputs, including when the
+AGENTS adapter is disabled. An obsolete owned inventory is removed after cleanup.
 
 Nested files use the same default conflict, `--adopt`, and `--force` behavior as
 root guidance. Replacing existing pointer stubs therefore requires explicitly

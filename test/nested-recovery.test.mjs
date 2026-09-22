@@ -20,6 +20,7 @@ function project(t, directory = "Old") {
 }
 
 function scope(root, directory) {
+  mkdirSync(join(root, directory), { recursive: true });
   writeFileSync(join(root, ".agents/rules/scope.md"),
     `---\ndescription: Scoped guidance\nactivation: path\npaths:\n  - "${directory}/**"\n---\n# Scoped guidance\n`);
 }
@@ -160,4 +161,32 @@ test("successful nested migration reports one final inventory update and removes
   assert.equal(existsSync(join(root, "New/AGENTS.md")), true);
   assert.equal(snapshot(root).some(([path]) => path.endsWith(".tmp")), false);
   assert.equal(checkProject(root).ok, true);
+});
+
+
+test("final verification catches output mutation after inventory finalization and reports each path once", (t) => {
+  const root = project(t);
+  assert.equal(syncProject(root).ok, true);
+  scope(root, "New");
+  const result = spawnSync(process.execPath, ["--input-type=module", "--eval", `
+import fs from "node:fs";
+import { syncBuiltinESMExports } from "node:module";
+const original = fs.renameSync;
+let inventories = 0;
+fs.renameSync = (source, target) => {
+  const result = original(source, target);
+  if (target === "nested-outputs.json" && ++inventories === 2) {
+    fs.writeFileSync(${JSON.stringify(join(root, "AGENTS.md"))}, "changed during finalization");
+  }
+  return result;
+};
+syncBuiltinESMExports();
+const { syncProject, GuidanceError } = await import(${JSON.stringify(moduleUrl)});
+let failure;
+try { syncProject(${JSON.stringify(root)}); } catch (error) { failure = error; }
+if (!(failure instanceof GuidanceError) || inventories !== 2) throw new Error("Expected final verification failure");
+const report = failure.message.split("Already updated: ")[1];
+if (!report || report.split(".agents/nested-outputs.json").length !== 2) throw new Error("Inventory must be reported once: " + failure.message);
+`], { encoding: "utf8" });
+  assert.equal(result.status, 0, result.stderr);
 });

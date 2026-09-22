@@ -56,6 +56,9 @@ const DEFAULT_ADAPTERS = Object.freeze({
 
 const GENERATED_FORMAT_VERSION = 1;
 const NESTED_MANIFEST_PATH = ".agents/nested-outputs.json";
+const NESTED_FILENAMES = Object.freeze(["AGENTS.md", "CLAUDE.md"]);
+const GLOB_METACHARACTERS = /[*?\[\]{}()!]/u;
+const comparePaths = (left, right) => left < right ? -1 : left > right ? 1 : 0;
 const TARGET_PATHS = Object.freeze({
   agents: "AGENTS.md",
   claude: "CLAUDE.md",
@@ -341,7 +344,7 @@ function parseConfig(contents) {
   }
   for (const name of Object.keys(DEFAULT_ADAPTERS)) {
     if (!Object.hasOwn(adapters, name)) {
-      throw new GuidanceError(`${CONFIG_PATH} needs adapters.${name}: true|false.`);
+      throw new GuidanceError(`${CONFIG_PATH} needs adapters.${name}: true|false${["cursor", "copilot"].includes(name) ? "|rules-only" : ""}.`);
     }
   }
   if (adapters.claude && !adapters.agents) {
@@ -602,19 +605,22 @@ function nestedRuleDirectory(rule) {
   // file-specific glob merely because it has a common literal prefix.
   if (rule.paths.length !== 1 || !rule.paths[0].endsWith("/**")) return null;
   const directory = rule.paths[0].slice(0, -3);
-  if (!directory || /[*?\[\]{}()!]/u.test(directory)) return null;
-  validateNestedTargetPath(`${directory}/AGENTS.md`);
+  if (!directory || !isNestedTargetPath(`${directory}/AGENTS.md`)) return null;
   return directory;
 }
 
 function validateNestedTargetPath(relativePath) {
-  validateRelativePath(relativePath);
-  validateRuleGlob(relativePath, NESTED_MANIFEST_PATH);
+  try {
+    validateRelativePath(relativePath);
+    validateRuleGlob(relativePath, NESTED_MANIFEST_PATH);
+  } catch (cause) {
+    throw new GuidanceError(`Unsafe nested guidance target: ${JSON.stringify(relativePath)}`, { cause });
+  }
   const segments = relativePath.split("/");
   if (
     segments.length < 2 ||
-    !["AGENTS.md", "CLAUDE.md"].includes(segments.at(-1)) ||
-    /[*?\[\]{}()!]/u.test(relativePath) ||
+    !NESTED_FILENAMES.includes(segments.at(-1)) ||
+    GLOB_METACHARACTERS.test(relativePath) ||
     segments.some((segment) => [".git", ".agents", "node_modules"].includes(segment.toLowerCase())) ||
     Object.values(SCOPED_ADAPTERS).some(({ namespace }) =>
       relativePath.toLowerCase().startsWith(`${namespace}/`)
@@ -624,17 +630,32 @@ function validateNestedTargetPath(relativePath) {
   }
 }
 
+function isNestedTargetPath(relativePath) {
+  if (!relativePath.includes("/") || !NESTED_FILENAMES.includes(basename(relativePath))) return false;
+  try {
+    validateNestedTargetPath(relativePath);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
 function nestedManifestTarget(paths) {
   const contents = `${JSON.stringify({
     generatedBy: "agent-guidance-sync",
     version: GENERATED_FORMAT_VERSION,
-    paths,
+    paths: [...paths].sort(comparePaths),
   }, null, 2)}\n`;
   return { relativePath: NESTED_MANIFEST_PATH, contents, unmanagedContents: contents };
 }
 
 function parseNestedManifest(contents) {
-  const manifest = JSON.parse(contents);
+  let manifest;
+  try {
+    manifest = JSON.parse(normalizeLineEndings(contents));
+  } catch (cause) {
+    throw new GuidanceError(`Invalid JSON in nested inventory ${NESTED_MANIFEST_PATH}.`, { cause });
+  }
   if (
     manifest?.generatedBy !== "agent-guidance-sync" ||
     manifest.version !== GENERATED_FORMAT_VERSION ||
@@ -643,8 +664,12 @@ function parseNestedManifest(contents) {
     Object.keys(manifest).sort().join(",") !== "generatedBy,paths,version"
   ) throw new GuidanceError(`Invalid generated nested inventory: ${NESTED_MANIFEST_PATH}`);
   for (const path of manifest.paths) {
-    if (typeof path !== "string") throw new GuidanceError("Invalid nested guidance path.");
-    validateNestedTargetPath(path);
+    try {
+      if (typeof path !== "string") throw new GuidanceError("Expected a string.");
+      validateNestedTargetPath(path);
+    } catch (cause) {
+      throw new GuidanceError(`Invalid path in nested inventory ${NESTED_MANIFEST_PATH}: ${JSON.stringify(path)}`, { cause });
+    }
   }
   return manifest.paths;
 }
@@ -657,7 +682,7 @@ export function renderTargets(
     throw new GuidanceError("The Claude adapter requires the AGENTS.md adapter.");
   }
   const orderedRules = [...rules].sort((left, right) =>
-    left.relativePath < right.relativePath ? -1 : left.relativePath > right.relativePath ? 1 : 0,
+    comparePaths(left.relativePath, right.relativePath),
   );
   const guide = sharedGuide(guideContents, orderedRules);
   const claudeImport = "@AGENTS.md\n";
@@ -672,8 +697,8 @@ export function renderTargets(
       nestedRules.get(directory).push(rule);
     }
   }
-  const nestedRuleCount = [...nestedRules.values()].reduce((count, rules) => count + rules.length, 0);
-  if (pathRules.length > nestedRuleCount && !adapters.cursor && !adapters.copilot) {
+  const nestedRuleSet = new Set([...nestedRules.values()].flat());
+  if (pathRules.length > nestedRuleSet.size && !adapters.cursor && !adapters.copilot) {
     throw new GuidanceError(
       "Path-activated rules require the Cursor or GitHub Copilot adapter unless every rule has an exact directory scope with nested: true and the AGENTS adapter enabled.",
     );
@@ -687,6 +712,7 @@ export function renderTargets(
       targets.push(renderedTarget(TARGET_PATHS.cursor, guide, cursorPrefix));
     }
     for (const rule of pathRules) {
+      if (adapters.cursor === "rules-only" && nestedRuleSet.has(rule)) continue;
       const relativePath = `${SCOPED_ADAPTERS.cursor.namespace}/${scopedTargetStem(rule)}.mdc`;
       targets.push(
         renderedTarget(
@@ -701,6 +727,7 @@ export function renderTargets(
   if (adapters.copilot) {
     if (adapters.copilot !== "rules-only") targets.push(renderedTarget(TARGET_PATHS.copilot, guide));
     for (const rule of pathRules) {
+      if (adapters.copilot === "rules-only" && nestedRuleSet.has(rule)) continue;
       const relativePath = `${SCOPED_ADAPTERS.copilot.namespace}/${scopedTargetStem(rule)}.instructions.md`;
       targets.push(
         renderedTarget(
@@ -713,11 +740,11 @@ export function renderTargets(
     }
   }
   const nestedPaths = [];
-  for (const [directory, rules] of [...nestedRules].sort(([left], [right]) => left < right ? -1 : left > right ? 1 : 0)) {
+  for (const [directory, rules] of [...nestedRules].sort(([left], [right]) => comparePaths(left, right))) {
     const body = rules.map((rule) =>
       `<!-- agent-guidance-sync:rule source="${RULES_PATH}/${rule.relativePath}" -->\n\n${rule.body.slice(0, -1)}\n`,
     ).join("\n");
-    for (const filename of ["AGENTS.md", ...(adapters.claude ? ["CLAUDE.md"] : [])]) {
+    for (const filename of NESTED_FILENAMES.filter((name) => name !== "CLAUDE.md" || adapters.claude)) {
       const relativePath = `${directory}/${filename}`;
       nestedPaths.push(relativePath);
       targets.push(renderedTarget(relativePath, body, "", RULES_PATH));
@@ -725,7 +752,7 @@ export function renderTargets(
   }
   // The final inventory follows guidance in the public plan. Synchronization
   // first records new destinations and only drops old ones after cleanup.
-  if (nested) targets.push(nestedManifestTarget(nestedPaths));
+  if (nestedPaths.length > 0) targets.push(nestedManifestTarget(nestedPaths));
   if (nested) {
     const paths = new Set();
     for (const { relativePath } of targets) {
@@ -1153,7 +1180,7 @@ function inspectTargetParentDirectories(
   root,
   targetPath,
   rootIdentity,
-  { allowMissing = false } = {},
+  { allowMissing = false, exactNames = false } = {},
 ) {
   const directories = [
     {
@@ -1172,6 +1199,11 @@ function inspectTargetParentDirectories(
       currentIdentity,
       `Generated directory changed while parents were inspected: ${relative(root, current).split(sep).join("/") || "."}`,
       () => {
+        if (exactNames && !readdirSync(".").includes(segment)) {
+          throw new GuidanceError(
+            `Nested scope directory must exist with exact spelling: ${relative(root, next).split(sep).join("/")}. Correct the rule or create/rename the directory explicitly.`,
+          );
+        }
         const child = lstatIfExists(segment);
         if (!child && allowMissing) return null;
         if (child?.isSymbolicLink()) {
@@ -1436,13 +1468,23 @@ function nestedTargetAliases(root, rootIdentity, previous, current) {
 function classifyObsoleteNestedTargets(root, rootIdentity, expectedPaths, expectedItems) {
   // Never infer deletion candidates from repository contents or traverse
   // unrelated trees. Only the validated, generated inventory names candidates.
-  const inventory = classifyTarget(root, rootIdentity, nestedManifestTarget([]), "none");
+  const inventory = expectedItems.find(({ relativePath }) => relativePath === NESTED_MANIFEST_PATH)
+    ?? classifyTarget(root, rootIdentity, nestedManifestTarget([]), "none");
   if (inventory.action === "create") return [];
-  if (["unsafe", "conflict"].includes(inventory.action)) {
+  if (inventory.action === "unsafe") {
     throw new GuidanceError(`Cannot read nested output inventory: ${inventory.reason}`);
   }
+  let previousPaths;
+  try {
+    previousPaths = parseNestedManifest(inventory.originalContents);
+  } catch (cause) {
+    throw new GuidanceError(
+      `${cause.message} Restore ${NESTED_MANIFEST_PATH} from a known-good generated copy; takeover flags cannot repair cleanup ownership.`,
+      { cause },
+    );
+  }
   const groups = [];
-  for (const relativePath of parseNestedManifest(inventory.originalContents)) {
+  for (const relativePath of previousPaths) {
     if (expectedPaths.has(relativePath)) continue;
     const item = classifyTarget(
       root,
@@ -1461,7 +1503,6 @@ function classifyObsoleteNestedTargets(root, rootIdentity, expectedPaths, expect
     const owned = group.find((candidate) => ["update", "unchanged"].includes(candidate.action));
     const current = expectedItems.find((candidate) =>
       candidate.relativePath !== NESTED_MANIFEST_PATH &&
-      hasOwnedMarkerForPath(candidate.contents, candidate.relativePath) &&
       nestedTargetAliases(root, rootIdentity, item, candidate),
     );
     if (current && (owned || hasOwnedMarkerForPath(item.originalContents, current.relativePath))) {
@@ -1478,7 +1519,9 @@ function classifyObsoleteNestedTargets(root, rootIdentity, expectedPaths, expect
       items.push({ ...owned, action: "delete", contents: null });
     } else {
       // Missing ownership or unsafe paths block cleanup even with --force.
-      items.push({ ...item, contents: null });
+      items.push({ ...item, contents: null, ...(item.action === "conflict" ? {
+        reason: "obsolete nested file lacks its exact ownership marker; restore the generated file, or move/remove it explicitly before retrying (takeover flags do not authorize cleanup)",
+      } : {}) });
     }
   }
   if (!expectedPaths.has(NESTED_MANIFEST_PATH)) {
@@ -1494,7 +1537,7 @@ function stagedTargetForTemporary(relativeDirectory, name) {
   return match ? `${relativeDirectory}/${match[1]}` : null;
 }
 
-function classifyManagedRuleNamespaces(root, rootIdentity, expectedPaths) {
+function classifyManagedRuleNamespaces(root, rootIdentity, expectedPaths, adapters) {
   const items = [];
   const visit = (directoryPath, relativeDirectory, expectedStats) => {
     withStableDirectory(
@@ -1590,9 +1633,8 @@ function classifyManagedRuleNamespaces(root, rootIdentity, expectedPaths) {
     );
   };
 
-  for (const { namespace: relativeNamespace, targetPath } of Object.values(SCOPED_ADAPTERS)) {
-    const adapterEnabled = expectedPaths.has(targetPath) ||
-      [...expectedPaths].some((path) => path.startsWith(`${relativeNamespace}/`));
+  for (const [name, { namespace: relativeNamespace }] of Object.entries(SCOPED_ADAPTERS)) {
+    const adapterEnabled = Boolean(adapters[name]);
     const issue = parentPathIssue(root, `${relativeNamespace}/.ownership-probe`);
     if (issue) {
       if (!adapterEnabled) continue;
@@ -1621,7 +1663,7 @@ function classifyManagedRuleNamespaces(root, rootIdentity, expectedPaths) {
   return items;
 }
 
-function classifyTarget(root, rootIdentity, target, takeover) {
+function classifyTarget(root, rootIdentity, target, takeover, { exactParents = false } = {}) {
   const issue = parentPathIssue(root, target.relativePath);
   if (issue) {
     return {
@@ -1641,11 +1683,11 @@ function classifyTarget(root, rootIdentity, target, takeover) {
       root,
       target.relativePath,
       rootIdentity,
-      { allowMissing: true },
+      { allowMissing: !exactParents, exactNames: exactParents },
     );
   } catch (error) {
     throw new GuidanceError(
-      `${target.relativePath} parent changed while guidance was being planned.`,
+      exactParents ? error.message : `${target.relativePath} parent changed while guidance was being planned.`,
       { cause: error },
     );
   }
@@ -1662,6 +1704,12 @@ function classifyTarget(root, rootIdentity, target, takeover) {
       const stats = lstatIfExists(targetName);
       if (!stats) {
         return { ...target, action: "create", originalContents: null, originalIdentity: null };
+      }
+      if (exactParents && !readdirSync(".").includes(targetName)) {
+        return {
+          ...target, action: "unsafe", originalContents: null, originalIdentity: null,
+          reason: `nested guidance filename must use exact spelling: ${targetName}; rename the existing file explicitly`,
+        };
       }
       if (stats.isSymbolicLink()) {
         return {
@@ -1996,23 +2044,25 @@ function renderCanonicalTargets(root) {
     rules: canonical.rules,
   });
   assertCanonicalSnapshotsUnchanged(canonical.snapshots);
-  return targets;
+  return { targets, adapters: canonical.config.adapters };
 }
 
 function planProjectWithRootIdentity(projectRoot, rootStats, takeover) {
   assertProjectRootUnchanged(projectRoot, rootStats, "while guidance was being planned");
-  const targets = renderCanonicalTargets(projectRoot);
+  const { targets, adapters } = renderCanonicalTargets(projectRoot);
   assertProjectRootUnchanged(projectRoot, rootStats, "while guidance was being planned");
   const expectedPaths = new Set(targets.map(({ relativePath }) => relativePath));
-  const expectedItems = targets.map((target) => classifyTarget(projectRoot, rootStats, target, takeover));
+  const expectedItems = targets.map((target) => classifyTarget(projectRoot, rootStats, target, takeover, {
+    exactParents: isNestedTargetPath(target.relativePath),
+  }));
   const plan = [
     ...expectedItems,
     ...classifyDisabledOwnedTargets(projectRoot, rootStats, expectedPaths),
-    ...classifyManagedRuleNamespaces(projectRoot, rootStats, expectedPaths),
+    ...classifyManagedRuleNamespaces(projectRoot, rootStats, expectedPaths, adapters),
     ...classifyObsoleteNestedTargets(projectRoot, rootStats, expectedPaths, expectedItems),
   ];
   assertProjectRootUnchanged(projectRoot, rootStats, "while guidance was being planned");
-  return plan;
+  return { plan, adapters };
 }
 
 export function planProject(root, { takeover = "none" } = {}) {
@@ -2024,11 +2074,14 @@ export function planProject(root, { takeover = "none" } = {}) {
   if (!rootStats?.isDirectory() || rootStats.isSymbolicLink()) {
     throw new GuidanceError(`Project root must be a real directory: ${projectRoot}`);
   }
-  return planProjectWithRootIdentity(projectRoot, rootStats, takeover);
+  return planProjectWithRootIdentity(projectRoot, rootStats, takeover).plan;
 }
 
 function assertTargetAtPathUnchanged(path, item) {
   const stats = lstatIfExists(path);
+  if (stats && isNestedTargetPath(item.relativePath) && !readdirSync(dirname(path)).includes(basename(path))) {
+    throw new GuidanceError(`Nested guidance filename must use exact spelling: ${item.relativePath}.`);
+  }
   if (item.originalContents === null) {
     if (stats) {
       throw new GuidanceError(`${item.relativePath} changed while guidance was being planned.`);
@@ -2131,11 +2184,11 @@ function stageAtomicWrite(root, item, rootIdentity) {
   assertProjectRootUnchanged(root, rootIdentity, "before guidance was staged");
   const path = absoluteTargetPath(root, item.relativePath);
   const parent = dirname(path);
-  const { createdDirectories, parentIdentity } = ensureTargetParentDirectories(
-    root,
-    item.relativePath,
-    rootIdentity,
-  );
+  const { createdDirectories, parentIdentity } = isNestedTargetPath(item.relativePath)
+    ? { createdDirectories: [], parentIdentity: inspectTargetParentDirectories(
+      root, item.relativePath, rootIdentity, { exactNames: true },
+    ).at(-1).identity }
+    : ensureTargetParentDirectories(root, item.relativePath, rootIdentity);
   assertProjectRootUnchanged(root, rootIdentity, "while guidance was being staged");
   const targetName = basename(path);
   const temporaryName = `.${targetName}.${process.pid}.${randomUUID()}.tmp`;
@@ -2234,22 +2287,34 @@ function stageAtomicWrite(root, item, rootIdentity) {
 
 function commitStagedWrite(root, staged, rootIdentity) {
   const { item, parent, parentIdentity, targetName, temporaryName } = staged;
+  const predecessor = staged.predecessor;
+  if (predecessor && !predecessor.committed) {
+    throw new GuidanceError(`Publication predecessor is not committed for ${item.relativePath}.`);
+  }
+  const expectedOriginal = predecessor ? {
+    ...item,
+    originalContents: predecessor.item.contents,
+    originalIdentity: predecessor.temporaryIdentity,
+  } : item;
   assertProjectRootUnchanged(root, rootIdentity, "before guidance was published");
   try {
+    if (isNestedTargetPath(item.relativePath)) {
+      inspectTargetParentDirectories(root, item.relativePath, rootIdentity, { exactNames: true });
+    }
     withStableDirectory(
       parent,
       parentIdentity,
       `${item.relativePath} parent directory changed before publication.`,
       () => {
         assertProjectRootUnchanged(root, rootIdentity, "before guidance was published");
-        assertTargetAtPathUnchanged(targetName, item);
+        assertTargetAtPathUnchanged(targetName, expectedOriginal);
         assertStagedFileUnchanged(
           staged,
           temporaryName,
           `${item.relativePath} temporary file changed before publication.`,
         );
 
-        if (item.originalContents === null) {
+        if (expectedOriginal.originalContents === null) {
           linkSync(temporaryName, targetName);
           staged.committed = true;
           const published = lstatIfExists(targetName);
@@ -2376,11 +2441,11 @@ function commitDeletion(root, item, rootIdentity) {
   }
 }
 
-function assertCanonicalSourceMatchesPlan(root, rootIdentity, plan) {
+function assertCanonicalSourceMatchesPlan(root, rootIdentity, plan, adapters) {
   assertProjectRootUnchanged(root, rootIdentity, "while canonical guidance was being verified");
-  let currentTargets;
+  let current;
   try {
-    currentTargets = renderCanonicalTargets(root);
+    current = renderCanonicalTargets(root);
   } catch (error) {
     throw new GuidanceError(
       "Canonical source changed while guidance was being synchronized.",
@@ -2394,8 +2459,9 @@ function assertCanonicalSourceMatchesPlan(root, rootIdentity, plan) {
       .map((item) => [item.relativePath, item.contents]),
   );
   if (
-    currentTargets.length !== plannedContents.size ||
-    currentTargets.some(
+    Object.keys(DEFAULT_ADAPTERS).some((name) => current.adapters[name] !== adapters[name]) ||
+    current.targets.length !== plannedContents.size ||
+    current.targets.some(
       (target) => plannedContents.get(target.relativePath) !== target.contents,
     )
   ) {
@@ -2403,16 +2469,11 @@ function assertCanonicalSourceMatchesPlan(root, rootIdentity, plan) {
   }
 }
 
-function assertTargetsMatchPlanPass(root, rootIdentity, plan, staged, deletions) {
+function assertTargetsMatchPlanPass(root, rootIdentity, plan, staged, deletions, adapters) {
   assertProjectRootUnchanged(root, rootIdentity, "while generated guidance was being verified");
-  const enabledScopedNamespaces = Object.values(SCOPED_ADAPTERS)
-    .filter(({ targetPath, namespace }) =>
-      plan.some(
-        (item) => (item.relativePath === targetPath || item.relativePath.startsWith(`${namespace}/`)) &&
-          typeof item.contents === "string",
-      )
-    )
-    .map(({ namespace }) => namespace);
+  const enabledScopedNamespaces = Object.entries(SCOPED_ADAPTERS)
+    .filter(([name]) => adapters[name])
+    .map(([, { namespace }]) => namespace);
   const stagedByPath = new Map(
     staged
       .filter((stagedWrite) => stagedWrite.committed)
@@ -2420,6 +2481,9 @@ function assertTargetsMatchPlanPass(root, rootIdentity, plan, staged, deletions)
   );
   for (const item of plan) {
     if (typeof item.contents !== "string") continue;
+    if (isNestedTargetPath(item.relativePath)) {
+      inspectTargetParentDirectories(root, item.relativePath, rootIdentity, { exactNames: true });
+    }
     const stagedWrite = stagedByPath.get(item.relativePath);
     if (!stagedWrite) {
       try {
@@ -2445,6 +2509,9 @@ function assertTargetsMatchPlanPass(root, rootIdentity, plan, staged, deletions)
       `${stagedItem.relativePath} parent directory changed after publication.`,
       () => {
         assertProjectRootUnchanged(root, rootIdentity, "while generated guidance was being verified");
+        if (isNestedTargetPath(item.relativePath) && !readdirSync(".").includes(targetName)) {
+          throw new GuidanceError(`Nested guidance filename must use exact spelling: ${item.relativePath}.`);
+        }
         const current = lstatIfExists(targetName);
         if (
           !current?.isFile() ||
@@ -2470,7 +2537,7 @@ function assertTargetsMatchPlanPass(root, rootIdentity, plan, staged, deletions)
       const enabledNamespace = enabledScopedNamespaces.find(
         (namespace) => item.relativePath.startsWith(`${namespace}/`),
       );
-      if (enabledNamespace || item.relativePath.endsWith("/AGENTS.md") || item.relativePath.endsWith("/CLAUDE.md")) {
+      if (enabledNamespace || isNestedTargetPath(item.relativePath)) {
         throw new GuidanceError(`${item.relativePath}: ${issue}`);
       }
       continue;
@@ -2499,9 +2566,9 @@ function assertTargetsMatchPlanPass(root, rootIdentity, plan, staged, deletions)
   assertProjectRootUnchanged(root, rootIdentity, "while generated guidance was being verified");
 }
 
-function assertTargetsMatchPlan(root, rootIdentity, plan, staged, deletions) {
-  assertTargetsMatchPlanPass(root, rootIdentity, plan, staged, deletions);
-  assertTargetsMatchPlanPass(root, rootIdentity, plan, staged, deletions);
+function assertTargetsMatchPlan(root, rootIdentity, plan, staged, deletions, adapters) {
+  assertTargetsMatchPlanPass(root, rootIdentity, plan, staged, deletions, adapters);
+  assertTargetsMatchPlanPass(root, rootIdentity, plan, staged, deletions, adapters);
 }
 
 export function checkProject(root) {
@@ -2523,7 +2590,7 @@ export function syncProject(root, { takeover = "none" } = {}) {
   if (!rootStats?.isDirectory() || rootStats.isSymbolicLink()) {
     throw new GuidanceError(`Project root must be a real directory: ${projectRoot}`);
   }
-  const plan = planProjectWithRootIdentity(projectRoot, rootStats, takeover);
+  const { plan, adapters } = planProjectWithRootIdentity(projectRoot, rootStats, takeover);
   const blocked = plan.filter((item) => ["conflict", "unsafe"].includes(item.action));
   if (blocked.length > 0) {
     return { changed: [], ok: false, plan, root: projectRoot };
@@ -2534,16 +2601,26 @@ export function syncProject(root, { takeover = "none" } = {}) {
     assertProjectRootUnchanged(projectRoot, rootStats, "before guidance was synchronized");
     assertTargetUnchanged(projectRoot, rootStats, item);
   }
-  assertCanonicalSourceMatchesPlan(projectRoot, rootStats, plan);
+  assertCanonicalSourceMatchesPlan(projectRoot, rootStats, plan, adapters);
 
   const staged = [];
   const deletions = changed.filter((item) => item.action === "delete");
   const writes = changed.filter((item) => item.action !== "delete");
-  const inventory = writes.find(({ relativePath }) => relativePath === NESTED_MANIFEST_PATH);
-  let inventoryRecovery = null;
+  const isInventory = ({ relativePath }) => relativePath === NESTED_MANIFEST_PATH;
+  const inventory = writes.find(isInventory);
+  const phases = {
+    journal: null,
+    guidance: [],
+    cleanup: deletions.filter((item) => !isInventory(item)),
+    finalize: null,
+    removeInventory: deletions.find(isInventory),
+  };
   try {
     for (const item of writes) {
-      staged.push(stageAtomicWrite(projectRoot, item, rootStats));
+      const write = stageAtomicWrite(projectRoot, item, rootStats);
+      staged.push(write);
+      if (isInventory(item)) phases.finalize = write;
+      else phases.guidance.push(write);
     }
     if (inventory) {
       const previousPaths = inventory.originalContents === null
@@ -2551,17 +2628,22 @@ export function syncProject(root, { takeover = "none" } = {}) {
         : parseNestedManifest(inventory.originalContents);
       const nextPaths = parseNestedManifest(inventory.contents);
       if (nextPaths.some((path) => !previousPaths.includes(path))) {
-        // Record new destinations before publishing any guidance. Keep old
-        // destinations until cleanup succeeds, so every partial publication
-        // remains discoverable even if the canonical rules change before retry.
-        const recovery = nestedManifestTarget([...new Set([...previousPaths, ...nextPaths])].sort());
-        inventoryRecovery = recovery.contents === inventory.contents
-          ? staged.find(({ item }) => item === inventory)
-          : stageAtomicWrite(projectRoot, { ...inventory, contents: recovery.contents }, rootStats);
-        if (!staged.includes(inventoryRecovery)) staged.unshift(inventoryRecovery);
+        // Journal every destination before publishing files; shrink only after
+        // cleanup. Both versions are staged against the unchanged original.
+        const recovery = nestedManifestTarget([...new Set([...previousPaths, ...nextPaths])]);
+        if (recovery.contents === inventory.contents) {
+          phases.journal = phases.finalize;
+          phases.finalize = null;
+        } else {
+          phases.journal = stageAtomicWrite(projectRoot, { ...inventory, contents: recovery.contents }, rootStats);
+          staged.unshift(phases.journal);
+          // Publication checks this predecessor's exact bytes and identity.
+          // The canonical plan and staged final item remain unchanged.
+          phases.finalize.predecessor = phases.journal;
+        }
       }
     }
-    assertCanonicalSourceMatchesPlan(projectRoot, rootStats, plan);
+    assertCanonicalSourceMatchesPlan(projectRoot, rootStats, plan, adapters);
   } catch (error) {
     for (const stagedWrite of staged) removeStagedTemporary(stagedWrite);
     for (const stagedWrite of [...staged].reverse()) {
@@ -2571,47 +2653,26 @@ export function syncProject(root, { takeover = "none" } = {}) {
   }
 
   try {
-    if (inventoryRecovery) {
-      commitStagedWrite(projectRoot, inventoryRecovery, rootStats);
-      const finalInventory = staged.find(({ item }) => item === inventory);
-      if (finalInventory !== inventoryRecovery) {
-        // The final write was staged against the old inventory. Its publication
-        // must instead verify the exact recovery inventory just published.
-        finalInventory.item = {
-          ...inventory,
-          originalContents: inventoryRecovery.item.contents,
-          originalIdentity: identityFromStats(inventoryRecovery.temporaryIdentity, "Nested recovery inventory"),
-        };
-      }
-    }
-    for (const stagedWrite of staged) {
-      if (stagedWrite.item.relativePath === NESTED_MANIFEST_PATH) continue;
-      commitStagedWrite(projectRoot, stagedWrite, rootStats);
-    }
-    for (const item of deletions) {
-      if (item.relativePath !== NESTED_MANIFEST_PATH) commitDeletion(projectRoot, item, rootStats);
-    }
-    const inventoryChanged = changed.some(({ relativePath }) => relativePath === NESTED_MANIFEST_PATH);
-    if (inventoryChanged) {
-      assertCanonicalSourceMatchesPlan(projectRoot, rootStats, plan);
+    if (phases.journal) commitStagedWrite(projectRoot, phases.journal, rootStats);
+    for (const write of phases.guidance) commitStagedWrite(projectRoot, write, rootStats);
+    for (const item of phases.cleanup) commitDeletion(projectRoot, item, rootStats);
+    if (phases.finalize || phases.removeInventory) {
+      // Do not discard recovery paths until the source and all affected files
+      // are verified. Final verification also checks mutations during finalize.
+      assertCanonicalSourceMatchesPlan(projectRoot, rootStats, plan, adapters);
       assertTargetsMatchPlan(
         projectRoot,
         rootStats,
-        plan.filter(({ relativePath }) => relativePath !== NESTED_MANIFEST_PATH),
-        staged.filter(({ item }) => item.relativePath !== NESTED_MANIFEST_PATH),
-        deletions.filter(({ relativePath }) => relativePath !== NESTED_MANIFEST_PATH),
+        plan.filter((item) => !isInventory(item)),
+        phases.guidance,
+        phases.cleanup,
+        adapters,
       );
     }
-    for (const stagedWrite of staged) {
-      if (stagedWrite.item.relativePath === NESTED_MANIFEST_PATH && !stagedWrite.committed) {
-        commitStagedWrite(projectRoot, stagedWrite, rootStats);
-      }
-    }
-    for (const item of deletions) {
-      if (item.relativePath === NESTED_MANIFEST_PATH) commitDeletion(projectRoot, item, rootStats);
-    }
-    assertCanonicalSourceMatchesPlan(projectRoot, rootStats, plan);
-    assertTargetsMatchPlan(projectRoot, rootStats, plan, staged, deletions);
+    if (phases.finalize) commitStagedWrite(projectRoot, phases.finalize, rootStats);
+    if (phases.removeInventory) commitDeletion(projectRoot, phases.removeInventory, rootStats);
+    assertCanonicalSourceMatchesPlan(projectRoot, rootStats, plan, adapters);
+    assertTargetsMatchPlan(projectRoot, rootStats, plan, staged, deletions, adapters);
   } catch (error) {
     for (const stagedWrite of staged) removeStagedTemporary(stagedWrite);
     for (const stagedWrite of [...staged].reverse()) {
@@ -2622,7 +2683,7 @@ export function syncProject(root, { takeover = "none" } = {}) {
       ...deletions.filter((item) => item.committed),
     ];
     const partialWriteMessage = committed.length > 0
-      ? ` Already updated: ${committed.map(({ relativePath }) => relativePath).join(", ")}. Rerun check before retrying.`
+      ? ` Already updated: ${[...new Set(committed.map(({ relativePath }) => relativePath))].join(", ")}. Rerun check before retrying.`
       : " No target files were updated.";
     throw new GuidanceError(
       `${error instanceof Error ? error.message : String(error)}${partialWriteMessage}`,

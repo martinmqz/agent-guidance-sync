@@ -7,6 +7,7 @@ import {
   mkdtempSync,
   readFileSync,
   rmSync,
+  renameSync,
   writeFileSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
@@ -30,8 +31,17 @@ function repository(t, scope = "src") {
   writeFileSync(join(root, ".agents/guide.md"), "# Guide\n");
   writeFileSync(join(root, ".agents/config.yaml"), `${INITIAL_CONFIG}nested: true\n`);
   writeFileSync(join(root, ".agents/rules/scoped.md"), rule(scope));
+  mkdirSync(join(root, scope), { recursive: true });
   assert.equal(syncProject(root).ok, true);
   return root;
+}
+
+function prepareDirectory(root, previous, current) {
+  if (existsSync(join(root, `${current}/AGENTS.md`))) {
+    renameSync(join(root, previous), join(root, current));
+  } else {
+    mkdirSync(join(root, current), { recursive: true });
+  }
 }
 
 function read(root, path) {
@@ -47,6 +57,7 @@ test("equivalent nested scopes migrate according to actual filesystem identities
     for (const takeover of ["none", "adopt", "force"]) {
       const root = repository(t, previous);
       const aliases = existsSync(join(root, `${current}/AGENTS.md`));
+      prepareDirectory(root, previous, current);
       writeFileSync(join(root, ".agents/rules/scoped.md"), rule(current));
       const before = read(root, `${previous}/AGENTS.md`);
       const flags = takeover === "none" ? [] : [`--${takeover}`];
@@ -78,6 +89,7 @@ test("interrupted equivalent-scope migrations can be disabled or removed without
       for (const cleanup of ["disable", "remove-rule"]) {
         const root = repository(t, previous);
         const aliases = existsSync(join(root, `${current}/AGENTS.md`));
+        prepareDirectory(root, previous, current);
         writeFileSync(join(root, ".agents/rules/scoped.md"), rule(current));
         const hook = failure === "nested"
           ? 'target === "CLAUDE.md"'
@@ -126,6 +138,7 @@ test("case migration recovers inventories containing both aliases and mixed owne
     t.skip("Case aliases require a case-insensitive filesystem");
     return;
   }
+  prepareDirectory(root, "src", "Src");
   writeFileSync(join(root, ".agents/rules/scoped.md"), rule("Src"));
   const inventory = JSON.parse(read(root, inventoryPath));
   inventory.paths.push(...nestedNames.map((name) => `Src/${name}`));
@@ -162,11 +175,12 @@ test("separate hard links in case-distinct directories remain separate planned t
 test("a case-only spelling change does not claim unmanaged nested contents", (t) => {
   const root = repository(t);
   writeFileSync(join(root, "src/AGENTS.md"), "# Personal instructions\n");
+  prepareDirectory(root, "src", "Src");
   writeFileSync(join(root, ".agents/rules/scoped.md"), rule("Src"));
   const inventory = read(root, inventoryPath);
   for (const takeover of ["none", "adopt", "force"]) {
     assert.equal(syncProject(root, { takeover }).ok, false);
-    assert.equal(read(root, "src/AGENTS.md"), "# Personal instructions\n");
+    assert.equal(read(root, existsSync(join(root, "src/AGENTS.md")) ? "src/AGENTS.md" : "Src/AGENTS.md"), "# Personal instructions\n");
     assert.equal(read(root, inventoryPath), inventory);
   }
 });
