@@ -10,7 +10,8 @@ guidance with AI and it is not an MCP server.
 
 The current milestone supports safe initialization, repository-wide guidance,
 always-activated rules, path-activated Cursor and GitHub Copilot rules,
-non-mutating sync previews, and machine-readable output.
+optional directory-scoped AGENTS and Claude guidance, non-mutating sync previews,
+and machine-readable output.
 
 ## Usage
 
@@ -18,10 +19,10 @@ Initialize the current Git repository, edit the new canonical guide, then sync
 and check the generated files:
 
 ```sh
-npx @martinmqz/agent-guidance-sync init
+npx @martinmqz/agent-guidance-sync@0.1.2 init
 # Edit .agents/guide.md
-npx @martinmqz/agent-guidance-sync sync
-npx @martinmqz/agent-guidance-sync check
+npx @martinmqz/agent-guidance-sync@0.1.2 sync
+npx @martinmqz/agent-guidance-sync@0.1.2 check
 ```
 
 `init` reuses the nearest existing canonical source, otherwise finds the nearest
@@ -93,6 +94,28 @@ All adapter keys are required. Disabling an adapter removes only outputs with
 an exact `agent-guidance-sync` ownership marker. The Claude adapter requires the
 AGENTS adapter because `CLAUDE.md` imports `AGENTS.md`.
 
+Cursor and Copilot also accept `rules-only`, which generates path rules but
+omits that adapter's repository-wide copy. With `nested: true`, it also omits
+path-rule copies already represented by nested `AGENTS.md` files. This is useful
+when the client reads native guidance: [Cursor supports nested AGENTS.md](https://cursor.com/docs/rules),
+and [VS Code requires `chat.useAgentsMdFile` and `chat.useNestedAgentsMdFiles`](https://code.visualstudio.com/docs/agent-customization/custom-instructions#use-multiple-agentsmd-files).
+Existing owned duplicate copies are removed; unmanaged root files are preserved.
+Keep `copilot: true` when you need the root `.github/copilot-instructions.md`
+and all path instructions for GitHub.com consumers. For example:
+
+```yaml
+version: 1
+adapters:
+  agents: true
+  claude: true
+  cursor: rules-only
+  copilot: true
+nested: true
+```
+
+`nested` is optional and defaults to `false`. Existing boolean adapter
+configurations retain their behavior.
+
 Rules live in lowercase kebab-case `.agents/rules/**/*.md` paths. An
 always-activated rule is inlined into repository-wide outputs:
 
@@ -122,8 +145,8 @@ Prefer observable behavior over implementation details.
 ```
 
 Every rule body must begin with a level-one Markdown heading. Path-activated
-rules require at least one of the Cursor or GitHub Copilot adapters because
-those adapters own the scoped-rule formats.
+rules require at least one of the Cursor or GitHub Copilot adapters, unless
+every path rule can be represented by enabled nested guidance as described below.
 
 Descriptions and paths may be unquoted, single-quoted, or JSON-style
 double-quoted strings. Paths must use the indented list form shown above and
@@ -141,12 +164,63 @@ traversed; symlinks and non-regular entries remain unsafe. A
 leading UTF-8 byte-order mark is stripped from the guide, config, and rule files
 before parsing or generation.
 
+### Nested directory guidance
+
+With `nested: true` and `agents: true`, a rule with a single literal directory
+followed by `/**` also generates `<directory>/AGENTS.md`. If `claude: true`, it
+generates `<directory>/CLAUDE.md` with the same rule bodies inlined, without YAML
+frontmatter or imports. For example, `Scripts/**` and
+`MileagePosting/AlaskaAir.MileagePosting.Cores/**` each map to their own directory.
+Rules for the same directory are combined in canonical rule-path order.
+The directory must already exist, and every directory component must match its
+on-disk spelling exactly, including case and Unicode spelling. Correct the rule
+or explicitly create/rename the directory before syncing. The tool never creates
+scope directories. Existing nested filenames must likewise match `AGENTS.md` or
+`CLAUDE.md` exactly. These checks keep markers and inventory paths portable when
+the repository moves between filesystems.
+
+Patterns such as `src/**/*.ts`, wildcard directories, and rules spanning multiple
+directories retain only their Cursor/Copilot output. A shared literal prefix
+does not make a file-specific rule apply to every descendant, so the tool never
+broadens these patterns into directory instructions. Rules for reserved `.git`,
+`.agents`, and `node_modules` directories, or either reserved `agent-guidance/`
+scoped-rule namespace, also retain only Cursor/Copilot output. Overlapping
+generated target paths are rejected.
+
+Commit the generated `.agents/nested-outputs.json` inventory alongside nested
+files. It lets `check` and `sync` find obsolete nested outputs without scanning
+the repository. Removing a rule, disabling an adapter, or removing `nested: true`
+cleans up inventory-listed files only when their exact ownership markers still
+match. Unmanaged or unsafe obsolete targets block cleanup even with `--force`.
+For an unmanaged obsolete file, restore its generated contents from version
+control, or move/remove that file explicitly before retrying. If the inventory
+is invalid, restore the inventory itself from a known-good generated copy;
+takeover flags cannot establish safe cleanup ownership. A UTF-8 BOM in the
+inventory is accepted.
+Before publishing new nested files, synchronization records both old and new
+destinations in the inventory. It removes obsolete entries only after cleanup
+succeeds, so a failed sync remains recoverable even if rules change before retry.
+After an explicit directory rename, older inventory spellings can migrate owned
+files when filesystem identities prove they refer to the same directory entry.
+The tool preserves neighboring files and directories. Do not delete the inventory
+manually: without it, old nested outputs cannot be discovered for cleanup.
+No inventory is emitted when there are no nested outputs, including when the
+AGENTS adapter is disabled. An obsolete owned inventory is removed after cleanup.
+
+Nested files use the same default conflict, `--adopt`, and `--force` behavior as
+root guidance. Replacing existing pointer stubs therefore requires explicitly
+adopting an identical body or replacing them with `sync --force` after reviewing
+the dry run. Client support varies: [Cursor supports nested AGENTS.md](https://cursor.com/docs/rules),
+[Claude loads nested CLAUDE.md on demand](https://code.claude.com/docs/en/memory),
+and [VS Code's nested AGENTS.md support requires its experimental setting](https://code.visualstudio.com/docs/agent-customization/custom-instructions#_use-multiple-agentsmd-files).
+
 The package installs the `agent-guidance` executable and generates:
 
 | Agent | Generated target |
 | --- | --- |
 | Codex and compatible agents | `AGENTS.md` |
 | Claude Code | `CLAUDE.md` |
+| Optional directory guidance | `<directory>/AGENTS.md`, `<directory>/CLAUDE.md` |
 | Cursor | `.cursor/rules/agent-guidance.mdc` |
 | Cursor path rules | `.cursor/rules/agent-guidance/**/*.mdc` |
 | GitHub Copilot | `.github/copilot-instructions.md` |
@@ -196,6 +270,11 @@ output is emitted with LF. This avoids fresh Windows checkouts reporting drift
 solely because Git applied `core.autocrlf`.
 
 ## Migrating older prototypes
+
+Versions through 0.1.1 generated Cursor `globs` as JSON arrays. Version 0.1.2
+emits the [bare comma-separated format Cursor expects](https://cursor.com/docs/rules).
+An ordinary `sync` migrates old owned files without `--force`; obsolete files
+using the old format remain eligible for safe cleanup.
 
 Repositories that already have `.agents/guide.md` from an earlier release can
 rerun `agent-guidance init`. It adds the missing `.agents/config.yaml` without

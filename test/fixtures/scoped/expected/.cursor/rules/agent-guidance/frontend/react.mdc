@@ -1,6 +1,6 @@
 ---
 description: "React component guidance"
-globs: ["apps/web/**/*.tsx","packages/ui/**/*.tsx"]
+globs: apps/web/**/*.tsx,packages/ui/**/*.tsx
 alwaysApply: false
 ---
 
