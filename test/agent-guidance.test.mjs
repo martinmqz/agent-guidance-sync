@@ -885,7 +885,18 @@ test("nested guidance never broadens file globs or unrelated directory patterns"
 });
 
 test("nested guidance rejects unsafe directories and portable target collisions before writes", (t) => {
-  for (const paths of [[".agents/**"], [".git/**"], ["node_modules/pkg/**"], ["AGENTS.md/**"], ["src/**", "Src/**"], ["src/**", "src/AGENTS.md-other/**", "src/AGENTS.md/child/**"]]) {
+  for (const paths of [
+    [".agents/**"],
+    [".git/**"],
+    ["node_modules/pkg/**"],
+    [".cursor/rules/agent-guidance/custom/**"],
+    [".github/instructions/agent-guidance/custom/**"],
+    [".CURSOR/RULES/AGENT-GUIDANCE/custom/**"],
+    ["AGENTS.md/**"],
+    ["src/**", "Src/**"],
+    ["caf\u00e9/**", "cafe\u0301/**"],
+    ["src/**", "src/AGENTS.md-other/**", "src/AGENTS.md/child/**"],
+  ]) {
     const root = temporaryRepo(t);
     write(root, ".agents/config.yaml", `${INITIAL_CONFIG}nested: true\n`);
     for (const [index, path] of paths.entries()) {

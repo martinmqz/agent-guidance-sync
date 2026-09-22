@@ -615,7 +615,10 @@ function validateNestedTargetPath(relativePath) {
     segments.length < 2 ||
     !["AGENTS.md", "CLAUDE.md"].includes(segments.at(-1)) ||
     /[*?\[\]{}()!]/u.test(relativePath) ||
-    segments.some((segment) => [".git", ".agents", "node_modules"].includes(segment.toLowerCase()))
+    segments.some((segment) => [".git", ".agents", "node_modules"].includes(segment.toLowerCase())) ||
+    Object.values(SCOPED_ADAPTERS).some(({ namespace }) =>
+      relativePath.toLowerCase().startsWith(`${namespace}/`)
+    )
   ) {
     throw new GuidanceError(`Unsafe nested guidance target: ${relativePath}`);
   }
@@ -720,13 +723,13 @@ export function renderTargets(
       targets.push(renderedTarget(relativePath, body, "", RULES_PATH));
     }
   }
-  // Publish the inventory after all guidance and obsolete-file deletions so a
-  // failed cleanup retains the paths needed for the next sync.
+  // The final inventory follows guidance in the public plan. Synchronization
+  // first records new destinations and only drops old ones after cleanup.
   if (nested) targets.push(nestedManifestTarget(nestedPaths));
   if (nested) {
     const paths = new Set();
     for (const { relativePath } of targets) {
-      const path = relativePath.toLowerCase();
+      const path = relativePath.normalize("NFC").toLowerCase();
       if (paths.has(path)) {
         throw new GuidanceError(`Generated targets overlap on portable filesystems: ${relativePath}`);
       }
@@ -1415,7 +1418,22 @@ function classifyDisabledOwnedTargets(root, rootIdentity, expectedPaths) {
   return obsolete;
 }
 
-function classifyObsoleteNestedTargets(root, rootIdentity, expectedPaths) {
+function nestedTargetAliases(root, rootIdentity, previous, current) {
+  if (
+    previous.relativePath.normalize("NFC").toLowerCase() !== current.relativePath.normalize("NFC").toLowerCase() ||
+    previous.originalContents === null ||
+    previous.originalContents !== current.originalContents ||
+    !hasSameFileIdentity(previous.originalIdentity, current.originalIdentity)
+  ) return false;
+  // Equal file identities alone also occur for separate hard links. Matching
+  // parent directories and the exact filename prove these are the same entry.
+  const previousParents = inspectTargetParentDirectories(root, previous.relativePath, rootIdentity);
+  const currentParents = inspectTargetParentDirectories(root, current.relativePath, rootIdentity);
+  return basename(previous.relativePath) === basename(current.relativePath) &&
+    hasSameFileIdentity(previousParents.at(-1).identity, currentParents.at(-1).identity);
+}
+
+function classifyObsoleteNestedTargets(root, rootIdentity, expectedPaths, expectedItems) {
   // Never infer deletion candidates from repository contents or traverse
   // unrelated trees. Only the validated, generated inventory names candidates.
   const inventory = classifyTarget(root, rootIdentity, nestedManifestTarget([]), "none");
@@ -1423,7 +1441,7 @@ function classifyObsoleteNestedTargets(root, rootIdentity, expectedPaths) {
   if (["unsafe", "conflict"].includes(inventory.action)) {
     throw new GuidanceError(`Cannot read nested output inventory: ${inventory.reason}`);
   }
-  const items = [];
+  const groups = [];
   for (const relativePath of parseNestedManifest(inventory.originalContents)) {
     if (expectedPaths.has(relativePath)) continue;
     const item = classifyTarget(
@@ -1433,8 +1451,31 @@ function classifyObsoleteNestedTargets(root, rootIdentity, expectedPaths) {
       "none",
     );
     if (item.action === "create") continue;
-    if (["update", "unchanged"].includes(item.action)) {
-      items.push({ ...item, action: "delete", contents: null });
+    const group = groups.find(([previous]) => nestedTargetAliases(root, rootIdentity, previous, item));
+    if (group) group.push(item);
+    else groups.push([item]);
+  }
+  const items = [];
+  for (const group of groups) {
+    const [item] = group;
+    const owned = group.find((candidate) => ["update", "unchanged"].includes(candidate.action));
+    const current = expectedItems.find((candidate) =>
+      candidate.relativePath !== NESTED_MANIFEST_PATH &&
+      hasOwnedMarkerForPath(candidate.contents, candidate.relativePath) &&
+      nestedTargetAliases(root, rootIdentity, item, candidate),
+    );
+    if (current && (owned || hasOwnedMarkerForPath(item.originalContents, current.relativePath))) {
+      // Equivalent scope spellings update one owned file on filesystems that
+      // alias them. Recovery inventories may retain either ownership spelling.
+      current.action = normalizeLineEndings(current.originalContents) === current.contents
+        ? "unchanged" : "update";
+      delete current.reason;
+      continue;
+    }
+    if (owned) {
+      // A recovery inventory can list several spellings of one entry. Delete
+      // it once using the spelling that carries its exact ownership marker.
+      items.push({ ...owned, action: "delete", contents: null });
     } else {
       // Missing ownership or unsafe paths block cleanup even with --force.
       items.push({ ...item, contents: null });
@@ -1963,11 +2004,12 @@ function planProjectWithRootIdentity(projectRoot, rootStats, takeover) {
   const targets = renderCanonicalTargets(projectRoot);
   assertProjectRootUnchanged(projectRoot, rootStats, "while guidance was being planned");
   const expectedPaths = new Set(targets.map(({ relativePath }) => relativePath));
+  const expectedItems = targets.map((target) => classifyTarget(projectRoot, rootStats, target, takeover));
   const plan = [
-    ...targets.map((target) => classifyTarget(projectRoot, rootStats, target, takeover)),
+    ...expectedItems,
     ...classifyDisabledOwnedTargets(projectRoot, rootStats, expectedPaths),
     ...classifyManagedRuleNamespaces(projectRoot, rootStats, expectedPaths),
-    ...classifyObsoleteNestedTargets(projectRoot, rootStats, expectedPaths),
+    ...classifyObsoleteNestedTargets(projectRoot, rootStats, expectedPaths, expectedItems),
   ];
   assertProjectRootUnchanged(projectRoot, rootStats, "while guidance was being planned");
   return plan;
@@ -2497,9 +2539,27 @@ export function syncProject(root, { takeover = "none" } = {}) {
   const staged = [];
   const deletions = changed.filter((item) => item.action === "delete");
   const writes = changed.filter((item) => item.action !== "delete");
+  const inventory = writes.find(({ relativePath }) => relativePath === NESTED_MANIFEST_PATH);
+  let inventoryRecovery = null;
   try {
     for (const item of writes) {
       staged.push(stageAtomicWrite(projectRoot, item, rootStats));
+    }
+    if (inventory) {
+      const previousPaths = inventory.originalContents === null
+        ? []
+        : parseNestedManifest(inventory.originalContents);
+      const nextPaths = parseNestedManifest(inventory.contents);
+      if (nextPaths.some((path) => !previousPaths.includes(path))) {
+        // Record new destinations before publishing any guidance. Keep old
+        // destinations until cleanup succeeds, so every partial publication
+        // remains discoverable even if the canonical rules change before retry.
+        const recovery = nestedManifestTarget([...new Set([...previousPaths, ...nextPaths])].sort());
+        inventoryRecovery = recovery.contents === inventory.contents
+          ? staged.find(({ item }) => item === inventory)
+          : stageAtomicWrite(projectRoot, { ...inventory, contents: recovery.contents }, rootStats);
+        if (!staged.includes(inventoryRecovery)) staged.unshift(inventoryRecovery);
+      }
     }
     assertCanonicalSourceMatchesPlan(projectRoot, rootStats, plan);
   } catch (error) {
@@ -2511,6 +2571,19 @@ export function syncProject(root, { takeover = "none" } = {}) {
   }
 
   try {
+    if (inventoryRecovery) {
+      commitStagedWrite(projectRoot, inventoryRecovery, rootStats);
+      const finalInventory = staged.find(({ item }) => item === inventory);
+      if (finalInventory !== inventoryRecovery) {
+        // The final write was staged against the old inventory. Its publication
+        // must instead verify the exact recovery inventory just published.
+        finalInventory.item = {
+          ...inventory,
+          originalContents: inventoryRecovery.item.contents,
+          originalIdentity: identityFromStats(inventoryRecovery.temporaryIdentity, "Nested recovery inventory"),
+        };
+      }
+    }
     for (const stagedWrite of staged) {
       if (stagedWrite.item.relativePath === NESTED_MANIFEST_PATH) continue;
       commitStagedWrite(projectRoot, stagedWrite, rootStats);
@@ -2530,7 +2603,7 @@ export function syncProject(root, { takeover = "none" } = {}) {
       );
     }
     for (const stagedWrite of staged) {
-      if (stagedWrite.item.relativePath === NESTED_MANIFEST_PATH) {
+      if (stagedWrite.item.relativePath === NESTED_MANIFEST_PATH && !stagedWrite.committed) {
         commitStagedWrite(projectRoot, stagedWrite, rootStats);
       }
     }

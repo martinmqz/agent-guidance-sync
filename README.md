@@ -174,13 +174,19 @@ Patterns such as `src/**/*.ts`, wildcard directories, and rules spanning multipl
 directories retain only their Cursor/Copilot output. A shared literal prefix
 does not make a file-specific rule apply to every descendant, so the tool never
 broadens these patterns into directory instructions. Reserved `.git`, `.agents`,
-and `node_modules` directories and overlapping generated target paths are rejected.
+and `node_modules` directories, the two reserved `agent-guidance/` scoped-rule
+namespaces, and overlapping generated target paths are rejected.
 
 Commit the generated `.agents/nested-outputs.json` inventory alongside nested
 files. It lets `check` and `sync` find obsolete nested outputs without scanning
 the repository. Removing a rule, disabling an adapter, or removing `nested: true`
 cleans up inventory-listed files only when their exact ownership markers still
 match. Unmanaged or unsafe obsolete targets block cleanup even with `--force`.
+Before publishing new nested files, synchronization records both old and new
+destinations in the inventory. It removes obsolete entries only after cleanup
+succeeds, so a failed sync remains recoverable even if rules change before retry.
+Changes in scope capitalization or Unicode spelling migrate owned files when
+the filesystem treats both paths as the same directory entry.
 The tool preserves neighboring files and directories. Do not delete the inventory
 manually: without it, old nested outputs cannot be discovered for cleanup.
 
