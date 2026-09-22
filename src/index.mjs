@@ -55,6 +55,7 @@ const DEFAULT_ADAPTERS = Object.freeze({
 });
 
 const GENERATED_FORMAT_VERSION = 1;
+const NESTED_MANIFEST_PATH = ".agents/nested-outputs.json";
 const TARGET_PATHS = Object.freeze({
   agents: "AGENTS.md",
   claude: "CLAUDE.md",
@@ -282,6 +283,7 @@ function parseConfig(contents) {
   let adaptersDeclared = false;
   let inAdapters = false;
   let version = null;
+  let nested;
 
   for (const rawLine of normalizeLineEndings(contents).split("\n")) {
     if (!rawLine.trim() || rawLine.trimStart().startsWith("#")) continue;
@@ -305,7 +307,15 @@ function parseConfig(contents) {
       continue;
     }
 
-    const adapterMatch = /^  ([a-z]+):\s*(true|false)\s*$/u.exec(rawLine);
+    const nestedMatch = /^nested:\s*(true|false)\s*$/u.exec(rawLine);
+    if (nestedMatch) {
+      if (nested !== undefined) throw new GuidanceError(`${CONFIG_PATH} declares nested more than once.`);
+      nested = nestedMatch[1] === "true";
+      inAdapters = false;
+      continue;
+    }
+
+    const adapterMatch = /^  ([a-z]+):\s*(true|false|rules-only)\s*$/u.exec(rawLine);
     if (adapterMatch && inAdapters) {
       const [, name, enabled] = adapterMatch;
       if (!Object.hasOwn(DEFAULT_ADAPTERS, name)) {
@@ -314,7 +324,10 @@ function parseConfig(contents) {
       if (Object.hasOwn(adapters, name)) {
         throw new GuidanceError(`${CONFIG_PATH} declares adapter ${name} more than once.`);
       }
-      adapters[name] = enabled === "true";
+      if (enabled === "rules-only" && !["cursor", "copilot"].includes(name)) {
+        throw new GuidanceError(`Adapter ${name} does not support rules-only.`);
+      }
+      adapters[name] = enabled === "rules-only" ? enabled : enabled === "true";
       continue;
     }
     throw new GuidanceError(`Invalid ${CONFIG_PATH} line: ${rawLine}`);
@@ -334,7 +347,7 @@ function parseConfig(contents) {
   if (adapters.claude && !adapters.agents) {
     throw new GuidanceError(`${CONFIG_PATH}: the Claude adapter requires the AGENTS.md adapter.`);
   }
-  return { adapters, version: 1 };
+  return { adapters, nested: nested ?? false, version: 1 };
 }
 
 function parseFrontmatterScalar(rawValue, relativePath, key) {
@@ -565,7 +578,7 @@ function sharedGuide(guideContents, rules) {
 function scopedCursorPreamble(rule) {
   return `---
 description: ${JSON.stringify(rule.description)}
-globs: ${JSON.stringify(rule.paths)}
+globs: ${rule.paths.join(",")}
 alwaysApply: false
 ---
 
@@ -584,9 +597,58 @@ function scopedTargetStem(rule) {
   return rule.relativePath.slice(0, -".md".length);
 }
 
+function nestedRuleDirectory(rule) {
+  // A directory instruction applies to every descendant. Do not broaden a
+  // file-specific glob merely because it has a common literal prefix.
+  if (rule.paths.length !== 1 || !rule.paths[0].endsWith("/**")) return null;
+  const directory = rule.paths[0].slice(0, -3);
+  if (!directory || /[*?\[\]{}()!]/u.test(directory)) return null;
+  validateNestedTargetPath(`${directory}/AGENTS.md`);
+  return directory;
+}
+
+function validateNestedTargetPath(relativePath) {
+  validateRelativePath(relativePath);
+  validateRuleGlob(relativePath, NESTED_MANIFEST_PATH);
+  const segments = relativePath.split("/");
+  if (
+    segments.length < 2 ||
+    !["AGENTS.md", "CLAUDE.md"].includes(segments.at(-1)) ||
+    /[*?\[\]{}()!]/u.test(relativePath) ||
+    segments.some((segment) => [".git", ".agents", "node_modules"].includes(segment.toLowerCase()))
+  ) {
+    throw new GuidanceError(`Unsafe nested guidance target: ${relativePath}`);
+  }
+}
+
+function nestedManifestTarget(paths) {
+  const contents = `${JSON.stringify({
+    generatedBy: "agent-guidance-sync",
+    version: GENERATED_FORMAT_VERSION,
+    paths,
+  }, null, 2)}\n`;
+  return { relativePath: NESTED_MANIFEST_PATH, contents, unmanagedContents: contents };
+}
+
+function parseNestedManifest(contents) {
+  const manifest = JSON.parse(contents);
+  if (
+    manifest?.generatedBy !== "agent-guidance-sync" ||
+    manifest.version !== GENERATED_FORMAT_VERSION ||
+    !Array.isArray(manifest.paths) ||
+    new Set(manifest.paths).size !== manifest.paths.length ||
+    Object.keys(manifest).sort().join(",") !== "generatedBy,paths,version"
+  ) throw new GuidanceError(`Invalid generated nested inventory: ${NESTED_MANIFEST_PATH}`);
+  for (const path of manifest.paths) {
+    if (typeof path !== "string") throw new GuidanceError("Invalid nested guidance path.");
+    validateNestedTargetPath(path);
+  }
+  return manifest.paths;
+}
+
 export function renderTargets(
   guideContents,
-  { adapters = DEFAULT_ADAPTERS, rules = [] } = {},
+  { adapters = DEFAULT_ADAPTERS, rules = [], nested = false } = {},
 ) {
   if (adapters.claude && !adapters.agents) {
     throw new GuidanceError("The Claude adapter requires the AGENTS.md adapter.");
@@ -598,9 +660,19 @@ export function renderTargets(
   const claudeImport = "@AGENTS.md\n";
   const cursorPrefix = cursorPreamble();
   const pathRules = orderedRules.filter(({ activation }) => activation === "path");
-  if (pathRules.length > 0 && !adapters.cursor && !adapters.copilot) {
+  const nestedRules = new Map();
+  if (nested && adapters.agents) {
+    for (const rule of pathRules) {
+      const directory = nestedRuleDirectory(rule);
+      if (directory === null) continue;
+      if (!nestedRules.has(directory)) nestedRules.set(directory, []);
+      nestedRules.get(directory).push(rule);
+    }
+  }
+  const nestedRuleCount = [...nestedRules.values()].reduce((count, rules) => count + rules.length, 0);
+  if (pathRules.length > nestedRuleCount && !adapters.cursor && !adapters.copilot) {
     throw new GuidanceError(
-      "Path-activated rules require the Cursor or GitHub Copilot adapter.",
+      "Path-activated rules require the Cursor or GitHub Copilot adapter unless every rule has an exact directory scope with nested: true and the AGENTS adapter enabled.",
     );
   }
   const targets = [];
@@ -608,7 +680,9 @@ export function renderTargets(
   if (adapters.agents) targets.push(renderedTarget(TARGET_PATHS.agents, guide));
   if (adapters.claude) targets.push(renderedTarget(TARGET_PATHS.claude, claudeImport));
   if (adapters.cursor) {
-    targets.push(renderedTarget(TARGET_PATHS.cursor, guide, cursorPrefix));
+    if (adapters.cursor !== "rules-only") {
+      targets.push(renderedTarget(TARGET_PATHS.cursor, guide, cursorPrefix));
+    }
     for (const rule of pathRules) {
       const relativePath = `${SCOPED_ADAPTERS.cursor.namespace}/${scopedTargetStem(rule)}.mdc`;
       targets.push(
@@ -622,7 +696,7 @@ export function renderTargets(
     }
   }
   if (adapters.copilot) {
-    targets.push(renderedTarget(TARGET_PATHS.copilot, guide));
+    if (adapters.copilot !== "rules-only") targets.push(renderedTarget(TARGET_PATHS.copilot, guide));
     for (const rule of pathRules) {
       const relativePath = `${SCOPED_ADAPTERS.copilot.namespace}/${scopedTargetStem(rule)}.instructions.md`;
       targets.push(
@@ -633,6 +707,38 @@ export function renderTargets(
           `${RULES_PATH}/${rule.relativePath}`,
         ),
       );
+    }
+  }
+  const nestedPaths = [];
+  for (const [directory, rules] of [...nestedRules].sort(([left], [right]) => left < right ? -1 : left > right ? 1 : 0)) {
+    const body = rules.map((rule) =>
+      `<!-- agent-guidance-sync:rule source="${RULES_PATH}/${rule.relativePath}" -->\n\n${rule.body.slice(0, -1)}\n`,
+    ).join("\n");
+    for (const filename of ["AGENTS.md", ...(adapters.claude ? ["CLAUDE.md"] : [])]) {
+      const relativePath = `${directory}/${filename}`;
+      nestedPaths.push(relativePath);
+      targets.push(renderedTarget(relativePath, body, "", RULES_PATH));
+    }
+  }
+  // Publish the inventory after all guidance and obsolete-file deletions so a
+  // failed cleanup retains the paths needed for the next sync.
+  if (nested) targets.push(nestedManifestTarget(nestedPaths));
+  if (nested) {
+    const paths = new Set();
+    for (const { relativePath } of targets) {
+      const path = relativePath.toLowerCase();
+      if (paths.has(path)) {
+        throw new GuidanceError(`Generated targets overlap on portable filesystems: ${relativePath}`);
+      }
+      paths.add(path);
+    }
+    for (const path of paths) {
+      const segments = path.split("/");
+      for (let index = 1; index < segments.length; index += 1) {
+        if (paths.has(segments.slice(0, index).join("/"))) {
+          throw new GuidanceError(`Generated targets overlap on portable filesystems: ${path}`);
+        }
+      }
     }
   }
   return targets;
@@ -1170,6 +1276,14 @@ function ensureTargetParentDirectories(root, targetPath, rootIdentity) {
 
 function hasOwnedMarkerForPath(contents, relativePath) {
   const normalized = normalizeLineEndings(contents);
+  if (relativePath === NESTED_MANIFEST_PATH) {
+    try {
+      parseNestedManifest(normalized);
+      return true;
+    } catch {
+      return false;
+    }
+  }
   let header = normalized;
   const cursorPrefix = `${SCOPED_ADAPTERS.cursor.namespace}/`;
   const copilotPrefix = `${SCOPED_ADAPTERS.copilot.namespace}/`;
@@ -1184,7 +1298,14 @@ function hasOwnedMarkerForPath(contents, relativePath) {
     if (!frontmatter) return false;
     try {
       const description = JSON.parse(frontmatter[1]);
-      const globs = JSON.parse(frontmatter[2]);
+      // Versions through 0.1.1 emitted a JSON array. Recognize it during
+      // migration so ordinary sync can update or prune those owned files.
+      let globs = frontmatter[2].split(",");
+      // Only the old string-array prefix is unambiguous: [1] and [null]
+      // are also valid character-class globs in the new scalar format.
+      if (/^\[\s*"/u.test(frontmatter[2])) {
+        globs = JSON.parse(frontmatter[2]);
+      }
       if (
         typeof description !== "string" ||
         !description ||
@@ -1194,6 +1315,7 @@ function hasOwnedMarkerForPath(contents, relativePath) {
       ) {
         return false;
       }
+      for (const glob of globs) validateRuleGlob(glob, relativePath);
     } catch {
       return false;
     }
@@ -1232,6 +1354,14 @@ function hasOwnedMarkerForPath(contents, relativePath) {
   if (relativePath.startsWith(copilotPrefix) && relativePath.endsWith(".instructions.md")) {
     const stem = relativePath.slice(copilotPrefix.length, -".instructions.md".length);
     return sourcePath === `${RULES_PATH}/${stem}.md`;
+  }
+  if (sourcePath === RULES_PATH) {
+    try {
+      validateNestedTargetPath(relativePath);
+      return true;
+    } catch {
+      return false;
+    }
   }
   return false;
 }
@@ -1283,6 +1413,37 @@ function classifyDisabledOwnedTargets(root, rootIdentity, expectedPaths) {
     );
   }
   return obsolete;
+}
+
+function classifyObsoleteNestedTargets(root, rootIdentity, expectedPaths) {
+  // Never infer deletion candidates from repository contents or traverse
+  // unrelated trees. Only the validated, generated inventory names candidates.
+  const inventory = classifyTarget(root, rootIdentity, nestedManifestTarget([]), "none");
+  if (inventory.action === "create") return [];
+  if (["unsafe", "conflict"].includes(inventory.action)) {
+    throw new GuidanceError(`Cannot read nested output inventory: ${inventory.reason}`);
+  }
+  const items = [];
+  for (const relativePath of parseNestedManifest(inventory.originalContents)) {
+    if (expectedPaths.has(relativePath)) continue;
+    const item = classifyTarget(
+      root,
+      rootIdentity,
+      renderedTarget(relativePath, "", "", RULES_PATH),
+      "none",
+    );
+    if (item.action === "create") continue;
+    if (["update", "unchanged"].includes(item.action)) {
+      items.push({ ...item, action: "delete", contents: null });
+    } else {
+      // Missing ownership or unsafe paths block cleanup even with --force.
+      items.push({ ...item, contents: null });
+    }
+  }
+  if (!expectedPaths.has(NESTED_MANIFEST_PATH)) {
+    items.push({ ...inventory, action: "delete", contents: null });
+  }
+  return items;
 }
 
 function stagedTargetForTemporary(relativeDirectory, name) {
@@ -1389,7 +1550,8 @@ function classifyManagedRuleNamespaces(root, rootIdentity, expectedPaths) {
   };
 
   for (const { namespace: relativeNamespace, targetPath } of Object.values(SCOPED_ADAPTERS)) {
-    const adapterEnabled = expectedPaths.has(targetPath);
+    const adapterEnabled = expectedPaths.has(targetPath) ||
+      [...expectedPaths].some((path) => path.startsWith(`${relativeNamespace}/`));
     const issue = parentPathIssue(root, `${relativeNamespace}/.ownership-probe`);
     if (issue) {
       if (!adapterEnabled) continue;
@@ -1789,6 +1951,7 @@ function renderCanonicalTargets(root) {
   const canonical = readCanonicalProject(root);
   const targets = renderTargets(canonical.guideContents, {
     adapters: canonical.config.adapters,
+    nested: canonical.config.nested,
     rules: canonical.rules,
   });
   assertCanonicalSnapshotsUnchanged(canonical.snapshots);
@@ -1804,6 +1967,7 @@ function planProjectWithRootIdentity(projectRoot, rootStats, takeover) {
     ...targets.map((target) => classifyTarget(projectRoot, rootStats, target, takeover)),
     ...classifyDisabledOwnedTargets(projectRoot, rootStats, expectedPaths),
     ...classifyManagedRuleNamespaces(projectRoot, rootStats, expectedPaths),
+    ...classifyObsoleteNestedTargets(projectRoot, rootStats, expectedPaths),
   ];
   assertProjectRootUnchanged(projectRoot, rootStats, "while guidance was being planned");
   return plan;
@@ -2200,9 +2364,10 @@ function assertCanonicalSourceMatchesPlan(root, rootIdentity, plan) {
 function assertTargetsMatchPlanPass(root, rootIdentity, plan, staged, deletions) {
   assertProjectRootUnchanged(root, rootIdentity, "while generated guidance was being verified");
   const enabledScopedNamespaces = Object.values(SCOPED_ADAPTERS)
-    .filter(({ targetPath }) =>
+    .filter(({ targetPath, namespace }) =>
       plan.some(
-        (item) => item.relativePath === targetPath && typeof item.contents === "string",
+        (item) => (item.relativePath === targetPath || item.relativePath.startsWith(`${namespace}/`)) &&
+          typeof item.contents === "string",
       )
     )
     .map(({ namespace }) => namespace);
@@ -2263,7 +2428,7 @@ function assertTargetsMatchPlanPass(root, rootIdentity, plan, staged, deletions)
       const enabledNamespace = enabledScopedNamespaces.find(
         (namespace) => item.relativePath.startsWith(`${namespace}/`),
       );
-      if (enabledNamespace) {
+      if (enabledNamespace || item.relativePath.endsWith("/AGENTS.md") || item.relativePath.endsWith("/CLAUDE.md")) {
         throw new GuidanceError(`${item.relativePath}: ${issue}`);
       }
       continue;
@@ -2347,9 +2512,31 @@ export function syncProject(root, { takeover = "none" } = {}) {
 
   try {
     for (const stagedWrite of staged) {
+      if (stagedWrite.item.relativePath === NESTED_MANIFEST_PATH) continue;
       commitStagedWrite(projectRoot, stagedWrite, rootStats);
     }
-    for (const item of deletions) commitDeletion(projectRoot, item, rootStats);
+    for (const item of deletions) {
+      if (item.relativePath !== NESTED_MANIFEST_PATH) commitDeletion(projectRoot, item, rootStats);
+    }
+    const inventoryChanged = changed.some(({ relativePath }) => relativePath === NESTED_MANIFEST_PATH);
+    if (inventoryChanged) {
+      assertCanonicalSourceMatchesPlan(projectRoot, rootStats, plan);
+      assertTargetsMatchPlan(
+        projectRoot,
+        rootStats,
+        plan.filter(({ relativePath }) => relativePath !== NESTED_MANIFEST_PATH),
+        staged.filter(({ item }) => item.relativePath !== NESTED_MANIFEST_PATH),
+        deletions.filter(({ relativePath }) => relativePath !== NESTED_MANIFEST_PATH),
+      );
+    }
+    for (const stagedWrite of staged) {
+      if (stagedWrite.item.relativePath === NESTED_MANIFEST_PATH) {
+        commitStagedWrite(projectRoot, stagedWrite, rootStats);
+      }
+    }
+    for (const item of deletions) {
+      if (item.relativePath === NESTED_MANIFEST_PATH) commitDeletion(projectRoot, item, rootStats);
+    }
     assertCanonicalSourceMatchesPlan(projectRoot, rootStats, plan);
     assertTargetsMatchPlan(projectRoot, rootStats, plan, staged, deletions);
   } catch (error) {

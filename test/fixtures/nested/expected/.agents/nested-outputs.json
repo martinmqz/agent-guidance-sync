@@ -1,0 +1,10 @@
+{
+  "generatedBy": "agent-guidance-sync",
+  "version": 1,
+  "paths": [
+    "MileagePosting/AlaskaAir.MileagePosting.Cores/AGENTS.md",
+    "MileagePosting/AlaskaAir.MileagePosting.Cores/CLAUDE.md",
+    "Scripts/AGENTS.md",
+    "Scripts/CLAUDE.md"
+  ]
+}

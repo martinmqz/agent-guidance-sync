@@ -1,0 +1,11 @@
+---
+description: "Script Quality guidance"
+globs: Scripts/**
+alwaysApply: false
+---
+
+<!-- agent-guidance-sync:generated:v1 source=".agents/rules/scripts-quality.md" target=".cursor/rules/agent-guidance/scripts-quality.mdc" -->
+
+# Script Quality
+
+Test error paths.

@@ -1,0 +1,11 @@
+---
+description: "Scripts guidance"
+globs: Scripts/**
+alwaysApply: false
+---
+
+<!-- agent-guidance-sync:generated:v1 source=".agents/rules/scripts.md" target=".cursor/rules/agent-guidance/scripts.mdc" -->
+
+# Scripts
+
+Keep scripts portable.

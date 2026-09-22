@@ -1,0 +1,11 @@
+---
+description: "Core Services guidance"
+globs: MileagePosting/AlaskaAir.MileagePosting.Cores/**
+alwaysApply: false
+---
+
+<!-- agent-guidance-sync:generated:v1 source=".agents/rules/cores.md" target=".cursor/rules/agent-guidance/cores.mdc" -->
+
+# Core Services
+
+Preserve service boundaries.

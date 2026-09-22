@@ -28,6 +28,7 @@ const fixtureRoot = join(packageRoot, "test", "fixtures", "basic");
 const expectedRoot = join(fixtureRoot, "expected");
 const scopedFixtureRoot = join(packageRoot, "test", "fixtures", "scoped");
 const scopedExpectedRoot = join(scopedFixtureRoot, "expected");
+const nestedFixtureRoot = join(packageRoot, "test", "fixtures", "nested");
 const generatedPaths = [
   "AGENTS.md",
   "CLAUDE.md",
@@ -605,6 +606,82 @@ test("generates deterministic always and path-activated rule adapters", (t) => {
   assert.doesNotMatch(read(root, "AGENTS.md"), /React Components/);
 });
 
+test("migrates legacy Cursor glob arrays without takeover and prunes legacy outputs", (t) => {
+  for (const obsolete of [false, true]) {
+    const root = temporaryDirectory(t);
+    cpSync(join(scopedFixtureRoot, ".agents"), join(root, ".agents"), { recursive: true });
+    cpSync(scopedExpectedRoot, root, { recursive: true });
+    const cursorPath = ".cursor/rules/agent-guidance/frontend/react.mdc";
+    const current = read(root, cursorPath);
+    const legacy = current.replace(
+      /^globs: (.+)$/mu,
+      (_, globs) => `globs: ${JSON.stringify(globs.split(","))}`,
+    );
+    write(root, cursorPath, legacy);
+    if (obsolete) rmSync(join(root, ".agents/rules/frontend/react.md"));
+    const before = snapshotFiles(root);
+
+    const check = runCli(root, "check", "--json");
+    assert.equal(check.status, 1, check.stderr);
+    assert.equal(
+      JSON.parse(check.stdout).plan.find(({ path }) => path === cursorPath).action,
+      obsolete ? "delete" : "update",
+    );
+    const preview = runCli(root, "sync", "--dry-run", "--json");
+    assert.equal(preview.status, 0, preview.stderr);
+    assert.deepEqual(JSON.parse(preview.stdout).plan, JSON.parse(check.stdout).plan);
+    assert.deepEqual(snapshotFiles(root), before);
+
+    const sync = runCli(root, "sync");
+    assert.equal(sync.status, 0, sync.stderr);
+    if (obsolete) assert.equal(lstatIfExists(join(root, cursorPath)), null);
+    else assert.equal(read(root, cursorPath), current);
+    assert.equal(runCli(root, "check").status, 0);
+  }
+});
+
+test("Cursor scalar globs preserve single patterns, character classes, and quoted descriptions", (t) => {
+  for (const glob of ["**/*.md", "[ab]/**/*.ts", "[1]", "[null]", "src/**", "null"]) {
+    const root = temporaryRepo(t);
+    write(root, ".agents/rules/scoped.md", `---
+description: 'Docs: use # headings'
+activation: path
+paths:
+  - "${glob}"
+---
+# Scoped guidance
+`);
+    const sync = runCli(root, "sync");
+    assert.equal(sync.status, 0, sync.stderr);
+    const contents = read(root, ".cursor/rules/agent-guidance/scoped.mdc");
+    assert.ok(contents.includes(`\nglobs: ${glob}\n`));
+    assert.ok(contents.includes('description: "Docs: use # headings"\n'));
+    assert.equal(runCli(root, "check").status, 0);
+  }
+});
+
+test("malformed Cursor glob headers never authorize stale output deletion", (t) => {
+  for (const globs of ['["src/**",null]', '"src/**"', '[""]', "src/**,", "../outside/**"]) {
+    const root = temporaryRepo(t);
+    const cursorPath = ".cursor/rules/agent-guidance/stale.mdc";
+    write(root, cursorPath, `---
+description: "Stale rule"
+globs: ${globs}
+alwaysApply: false
+---
+
+<!-- agent-guidance-sync:generated:v1 source=".agents/rules/stale.md" target="${cursorPath}" -->
+
+# Stale
+`);
+    const before = snapshotFiles(root);
+    const sync = runCli(root, "sync", "--force");
+    assert.equal(sync.status, 1);
+    assert.match(sync.stderr, /unmanaged/);
+    assert.deepEqual(snapshotFiles(root), before);
+  }
+});
+
 test("ignores auxiliary regular files in the canonical rules tree", (t) => {
   const root = temporaryDirectory(t);
   cpSync(join(scopedFixtureRoot, ".agents"), join(root, ".agents"), { recursive: true });
@@ -686,6 +763,272 @@ test("rendered targets expose only their consumed public fields", () => {
     "relativePath",
     "unmanagedContents",
   ]);
+});
+
+test("rules-only adapters remove owned root copies and keep path rules", (t) => {
+  const root = temporaryDirectory(t);
+  cpSync(join(scopedFixtureRoot, ".agents"), join(root, ".agents"), { recursive: true });
+  assert.equal(runCli(root, "sync").status, 0);
+  const config = read(root, ".agents/config.yaml");
+  write(root, ".agents/config.yaml", config.replace("cursor: true", "cursor: rules-only").replace("copilot: true", "copilot: rules-only"));
+  const before = snapshotFiles(root);
+  const preview = runCli(root, "sync", "--dry-run", "--json");
+  assert.equal(preview.status, 0, preview.stderr);
+  assert.deepEqual(JSON.parse(preview.stdout).plan.filter(({ action }) => action === "delete").map(({ path }) => path).sort(), [
+    ".cursor/rules/agent-guidance.mdc", ".github/copilot-instructions.md",
+  ]);
+  assert.deepEqual(snapshotFiles(root), before);
+  assert.equal(runCli(root, "sync").status, 0);
+  for (const path of listFiles(scopedExpectedRoot).filter((path) => ![".cursor/rules/agent-guidance.mdc", ".github/copilot-instructions.md"].includes(path))) {
+    assert.equal(read(root, path), read(scopedExpectedRoot, path));
+  }
+  assert.equal(runCli(root, "check").status, 0);
+  // Root files remain independently available for GitHub.com consumers.
+  write(root, ".agents/config.yaml", config);
+  assert.equal(runCli(root, "sync").status, 0);
+  assert.equal(read(root, ".github/copilot-instructions.md"), read(scopedExpectedRoot, ".github/copilot-instructions.md"));
+});
+
+test("rules-only adapters preserve unmanaged root files", (t) => {
+  const root = temporaryRepo(t);
+  write(root, ".agents/config.yaml", INITIAL_CONFIG.replace("cursor: true", "cursor: rules-only").replace("copilot: true", "copilot: rules-only"));
+  for (const path of [".cursor/rules/agent-guidance.mdc", ".github/copilot-instructions.md"]) {
+    write(root, path, "# Personal guidance\n");
+  }
+  const sync = runCli(root, "sync");
+  assert.equal(sync.status, 0, sync.stderr);
+  assert.equal(read(root, ".cursor/rules/agent-guidance.mdc"), "# Personal guidance\n");
+  assert.equal(read(root, ".github/copilot-instructions.md"), "# Personal guidance\n");
+});
+
+test("nested guidance inlines sorted rule bodies and participates in check and cleanup", (t) => {
+  const root = temporaryDirectory(t);
+  cpSync(join(nestedFixtureRoot, ".agents"), join(root, ".agents"), { recursive: true });
+  const initial = snapshotFiles(root);
+  const preview = runCli(root, "sync", "--dry-run", "--json");
+  assert.equal(preview.status, 0, preview.stderr);
+  assert.deepEqual(snapshotFiles(root), initial);
+  const sync = runCli(root, "sync");
+  assert.equal(sync.status, 0, sync.stderr);
+  for (const path of listFiles(join(nestedFixtureRoot, "expected"))) {
+    assert.equal(read(root, path), read(join(nestedFixtureRoot, "expected"), path));
+  }
+  const agents = read(root, "Scripts/AGENTS.md");
+  assert.ok(agents.indexOf("# Script Quality") < agents.indexOf("# Scripts\n"));
+  assert.doesNotMatch(agents, /activation:|paths:|description:/);
+  assert.match(read(root, "Scripts/CLAUDE.md"), /Keep scripts portable/);
+  assert.doesNotMatch(read(root, "Scripts/CLAUDE.md"), /@/);
+  assert.equal(runCli(root, "check").status, 0);
+
+  write(root, "Scripts/AGENTS.md", `${agents}\nExtra drift\n`);
+  assert.equal(runCli(root, "check").status, 1);
+  assert.equal(runCli(root, "sync").status, 0);
+  assert.equal(read(root, "Scripts/AGENTS.md"), agents);
+  write(root, "Scripts/personal.md", "keep\n");
+  rmSync(join(root, ".agents/rules/scripts.md"));
+  rmSync(join(root, ".agents/rules/scripts-quality.md"));
+  assert.equal(runCli(root, "sync").status, 0);
+  assert.equal(lstatIfExists(join(root, "Scripts/AGENTS.md")), null);
+  assert.equal(lstatIfExists(join(root, "Scripts/CLAUDE.md")), null);
+  assert.equal(read(root, "Scripts/personal.md"), "keep\n");
+
+  write(root, ".agents/config.yaml", read(root, ".agents/config.yaml").replace("nested: true\n", ""));
+  assert.equal(runCli(root, "sync").status, 0);
+  assert.equal(lstatIfExists(join(root, "MileagePosting/AlaskaAir.MileagePosting.Cores/AGENTS.md")), null);
+  assert.equal(lstatIfExists(join(root, ".agents/nested-outputs.json")), null);
+  assert.equal(runCli(root, "check").status, 0);
+});
+
+test("nested guidance supports AGENTS and Claude without glob adapters", (t) => {
+  const root = temporaryDirectory(t);
+  cpSync(join(nestedFixtureRoot, ".agents"), join(root, ".agents"), { recursive: true });
+  const config = read(root, ".agents/config.yaml").replace("cursor: rules-only", "cursor: false").replace("copilot: true", "copilot: false");
+  write(root, ".agents/config.yaml", config);
+  const sync = runCli(root, "sync");
+  assert.equal(sync.status, 0, sync.stderr);
+  assert.equal(runCli(root, "check").status, 0);
+  write(root, ".agents/config.yaml", config.replace("claude: true", "claude: false"));
+  assert.equal(runCli(root, "sync").status, 0);
+  assert.equal(lstatIfExists(join(root, "Scripts/CLAUDE.md")), null);
+  assert.ok(lstatIfExists(join(root, "Scripts/AGENTS.md")));
+});
+
+test("nested and adapter options reject unsupported values before writes", (t) => {
+  for (const config of [
+    INITIAL_CONFIG.replace("agents: true", "agents: rules-only"),
+    INITIAL_CONFIG.replace("claude: true", "claude: rules-only"),
+    `${INITIAL_CONFIG}nested: yes\n`,
+    `${INITIAL_CONFIG}nested: true\nnested: false\n`,
+  ]) {
+    const root = temporaryRepo(t);
+    write(root, ".agents/config.yaml", config);
+    const before = snapshotFiles(root);
+    assert.equal(runCli(root, "sync").status, 1);
+    assert.deepEqual(snapshotFiles(root), before);
+  }
+});
+
+test("nested guidance never broadens file globs or unrelated directory patterns", (t) => {
+  for (const paths of [["src/**/*.ts"], ["src/one/**", "src/two/**"], ["**/*.md"], ["src/*/**"]]) {
+    const root = temporaryRepo(t);
+    write(root, ".agents/config.yaml", `${INITIAL_CONFIG}nested: true\n`);
+    write(root, ".agents/rules/narrow.md", `---\ndescription: Narrow\nactivation: path\npaths:\n${paths.map((path) => `  - "${path}"`).join("\n")}\n---\n# Narrow\n`);
+    assert.equal(runCli(root, "sync").status, 0);
+    assert.deepEqual(JSON.parse(read(root, ".agents/nested-outputs.json")).paths, []);
+    write(root, ".agents/config.yaml", `${INITIAL_CONFIG.replace("cursor: true", "cursor: false").replace("copilot: true", "copilot: false")}nested: true\n`);
+    const before = snapshotFiles(root);
+    const sync = runCli(root, "sync");
+    assert.equal(sync.status, 1);
+    assert.match(sync.stderr, /Path-activated rules require/);
+    assert.deepEqual(snapshotFiles(root), before);
+  }
+});
+
+test("nested guidance rejects unsafe directories and portable target collisions before writes", (t) => {
+  for (const paths of [[".agents/**"], [".git/**"], ["node_modules/pkg/**"], ["AGENTS.md/**"], ["src/**", "Src/**"], ["src/**", "src/AGENTS.md-other/**", "src/AGENTS.md/child/**"]]) {
+    const root = temporaryRepo(t);
+    write(root, ".agents/config.yaml", `${INITIAL_CONFIG}nested: true\n`);
+    for (const [index, path] of paths.entries()) {
+      write(root, `.agents/rules/rule-${index}.md`, `---\ndescription: Scope\nactivation: path\npaths:\n  - "${path}"\n---\n# Scope\n`);
+    }
+    const before = snapshotFiles(root);
+    const sync = runCli(root, "sync", "--force");
+    assert.equal(sync.status, 1);
+    assert.match(sync.stderr, /Unsafe nested guidance target|Generated targets overlap/);
+    assert.deepEqual(snapshotFiles(root), before);
+  }
+});
+
+test("nested guidance preserves unmanaged targets and uses ordinary adoption and force rules", (t) => {
+  const root = temporaryDirectory(t);
+  cpSync(join(nestedFixtureRoot, ".agents"), join(root, ".agents"), { recursive: true });
+  write(root, "Scripts/AGENTS.md", "# Personal\n");
+  const before = snapshotFiles(root);
+  const blocked = runCli(root, "sync");
+  assert.equal(blocked.status, 1);
+  assert.deepEqual(snapshotFiles(root), before);
+  assert.equal(runCli(root, "sync", "--adopt").status, 1);
+  const force = runCli(root, "sync", "--force");
+  assert.equal(force.status, 0, force.stderr);
+  const owned = read(root, "Scripts/AGENTS.md");
+  write(root, "Scripts/AGENTS.md", owned.slice(owned.indexOf("\n\n") + 2));
+  assert.equal(runCli(root, "sync", "--adopt").status, 0);
+  assert.equal(read(root, "Scripts/AGENTS.md"), owned);
+});
+
+test("nested inventory cannot authorize unsafe paths or unmanaged deletion", (t) => {
+  for (const path of ["../outside/AGENTS.md", "AGENTS.md", ".agents/AGENTS.md", "src/*.md/AGENTS.md", "src/AGENTS.md"]) {
+    const root = temporaryRepo(t);
+    write(root, ".agents/nested-outputs.json", JSON.stringify({ generatedBy: "agent-guidance-sync", version: 1, paths: [path] }));
+    write(root, "src/AGENTS.md", "# Personal\n");
+    const before = snapshotFiles(root);
+    const sync = runCli(root, "sync", "--force");
+    assert.equal(sync.status, 1);
+    assert.deepEqual(snapshotFiles(root), before);
+  }
+});
+
+test("nested guidance rejects symlinked parents, targets, and inventory before writes", (t) => {
+  for (const path of ["Scripts", "Scripts/AGENTS.md", ".agents/nested-outputs.json"]) {
+    const root = temporaryDirectory(t);
+    cpSync(join(nestedFixtureRoot, ".agents"), join(root, ".agents"), { recursive: true });
+    const outside = temporaryDirectory(t);
+    write(outside, "AGENTS.md", "outside\n");
+    mkdirSync(dirname(join(root, path)), { recursive: true });
+    const isDirectory = path === "Scripts";
+    if (!createSymlinkOrSkip(t, isDirectory ? outside : join(outside, "AGENTS.md"), join(root, path), isDirectory ? "dir" : "file")) return;
+    const sync = runCli(root, "sync", "--force");
+    assert.equal(sync.status, 1);
+    assert.match(sync.stderr, /symlink/);
+    assert.equal(read(outside, "AGENTS.md"), "outside\n");
+    assert.equal(lstatIfExists(join(root, "AGENTS.md")), null);
+  }
+});
+
+test("nested cleanup retains its inventory when an obsolete file cannot be deleted", (t) => {
+  const root = temporaryDirectory(t);
+  cpSync(join(nestedFixtureRoot, ".agents"), join(root, ".agents"), { recursive: true });
+  assert.equal(runCli(root, "sync").status, 0);
+  const inventory = read(root, ".agents/nested-outputs.json");
+  write(root, ".agents/config.yaml", read(root, ".agents/config.yaml").replace("nested: true", "nested: false"));
+  const script = `
+import fs from "node:fs";
+import { syncBuiltinESMExports } from "node:module";
+const original = fs.rmSync;
+let injected = false;
+fs.rmSync = (path, options) => {
+  if (path === "AGENTS.md") { injected = true; throw new Error("injected deletion failure"); }
+  return original(path, options);
+};
+syncBuiltinESMExports();
+const { syncProject } = await import(${JSON.stringify(pathToFileURL(join(packageRoot, "src/index.mjs")).href)});
+let failed = false;
+try { syncProject(${JSON.stringify(root)}); } catch { failed = true; }
+if (!injected || !failed) throw new Error("Missing deletion failure");
+`;
+  const result = spawnSync(process.execPath, ["--input-type=module", "--eval", script], { encoding: "utf8" });
+  assert.equal(result.status, 0, result.stderr);
+  assert.equal(read(root, ".agents/nested-outputs.json"), inventory);
+  assert.equal(runCli(root, "sync").status, 0);
+  assert.equal(lstatIfExists(join(root, ".agents/nested-outputs.json")), null);
+  assert.equal(lstatIfExists(join(root, "Scripts/AGENTS.md")), null);
+  assert.equal(runCli(root, "check").status, 0);
+});
+
+test("nested cleanup requires exact source, target, and version markers", (t) => {
+  for (const [before, after] of [
+    ['source=".agents/rules"', 'source=".agents/guide.md"'],
+    ['target="Scripts/AGENTS.md"', 'target="Elsewhere/AGENTS.md"'],
+    ["generated:v1 ", "generated:v01 "],
+  ]) {
+    const root = temporaryDirectory(t);
+    cpSync(join(nestedFixtureRoot, ".agents"), join(root, ".agents"), { recursive: true });
+    assert.equal(runCli(root, "sync").status, 0);
+    write(root, "Scripts/AGENTS.md", read(root, "Scripts/AGENTS.md").replace(before, after));
+    write(root, ".agents/config.yaml", read(root, ".agents/config.yaml").replace("nested: true", "nested: false"));
+    const snapshot = snapshotFiles(root);
+    const sync = runCli(root, "sync", "--force");
+    assert.equal(sync.status, 1);
+    assert.deepEqual(snapshotFiles(root), snapshot);
+  }
+});
+
+test("nested cleanup retains its inventory if a deleted target parent becomes unsafe", { skip: process.platform === "win32" }, (t) => {
+  const root = temporaryDirectory(t);
+  cpSync(join(nestedFixtureRoot, ".agents"), join(root, ".agents"), { recursive: true });
+  assert.equal(runCli(root, "sync").status, 0);
+  const inventory = read(root, ".agents/nested-outputs.json");
+  write(root, ".agents/config.yaml", read(root, ".agents/config.yaml").replace("nested: true", "nested: false"));
+  const outside = temporaryDirectory(t);
+  write(outside, "CLAUDE.md", "outside\n");
+  const script = `
+import fs from "node:fs";
+import { syncBuiltinESMExports } from "node:module";
+import { join } from "node:path";
+const root = ${JSON.stringify(root)};
+const parent = fs.realpathSync(join(root, "Scripts"));
+const original = fs.rmSync;
+let injected = false;
+fs.rmSync = (path, options) => {
+  const result = original(path, options);
+  if (!injected && path === "CLAUDE.md" && process.cwd() === parent) {
+    fs.renameSync(parent, join(root, "Scripts-original"));
+    fs.symlinkSync(${JSON.stringify(outside)}, parent, "dir");
+    injected = true;
+  }
+  return result;
+};
+syncBuiltinESMExports();
+const { syncProject } = await import(${JSON.stringify(pathToFileURL(join(packageRoot, "src/index.mjs")).href)});
+let failed = false;
+try { syncProject(root); } catch { failed = true; }
+if (!injected) throw new Error("The deleted-parent substitution was not injected");
+if (!failed) throw new Error("Unsafe deleted parent was not rejected");
+`;
+  const result = spawnSync(process.execPath, ["--input-type=module", "--eval", script], { encoding: "utf8" });
+  assert.equal(result.status, 0, result.stderr);
+  assert.equal(read(root, ".agents/nested-outputs.json"), inventory);
+  assert.equal(read(outside, "CLAUDE.md"), "outside\n");
 });
 
 test("removes obsolete owned scoped outputs and preserves neighboring files", (t) => {
@@ -948,7 +1291,7 @@ adapters:
     wrongSourcePath,
     `---
 description: "Wrong source"
-globs: ["**/*.md"]
+globs: **/*.md
 alwaysApply: false
 ---
 
@@ -961,7 +1304,7 @@ alwaysApply: false
     wrongVersionPath,
     `---
 description: "Wrong version"
-globs: ["**/*.md"]
+globs: **/*.md
 alwaysApply: false
 ---
 
@@ -3850,6 +4193,31 @@ test("packs the exact public surface, installs, and runs the artifact", (t) => {
   });
   assert.equal(check.status, 0, check.stderr);
   assert.equal(JSON.parse(check.stdout).status, "in-sync");
+
+  cpSync(join(nestedFixtureRoot, ".agents"), join(consumerRoot, ".agents"), { recursive: true });
+  const nestedSync = spawnSync(process.execPath, [installedCli, "sync", "--json"], {
+    cwd: consumerRoot,
+    encoding: "utf8",
+  });
+  assert.equal(nestedSync.status, 0, nestedSync.stderr);
+  for (const path of listFiles(join(nestedFixtureRoot, "expected"))) {
+    assert.equal(read(consumerRoot, path), read(join(nestedFixtureRoot, "expected"), path));
+  }
+  assert.equal(lstatIfExists(join(consumerRoot, ".cursor/rules/agent-guidance.mdc")), null);
+  const cursorPath = ".cursor/rules/agent-guidance/scripts.mdc";
+  const scalarCursor = read(consumerRoot, cursorPath);
+  write(consumerRoot, cursorPath, scalarCursor.replace("globs: Scripts/**", 'globs: ["Scripts/**"]'));
+  const migrate = spawnSync(process.execPath, [installedCli, "sync"], {
+    cwd: consumerRoot,
+    encoding: "utf8",
+  });
+  assert.equal(migrate.status, 0, migrate.stderr);
+  assert.equal(read(consumerRoot, cursorPath), scalarCursor);
+  const nestedCheck = spawnSync(process.execPath, [installedCli, "check"], {
+    cwd: consumerRoot,
+    encoding: "utf8",
+  });
+  assert.equal(nestedCheck.status, 0, nestedCheck.stderr);
 });
 
 function lstatIfExists(path) {
